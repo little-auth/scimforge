@@ -9,6 +9,7 @@
 pub mod bulk;
 pub mod common;
 pub mod discovery;
+pub mod error;
 pub mod filter;
 pub mod group;
 pub mod list_response;
