@@ -80,6 +80,20 @@ implementation bug) and become hard test requirements, not optional hardening:
   against yet from a standalone library with no deployed caller; revisit once little-saas
   (or another consumer) wires this against a real test tenant.
 
+## Progress log (continued)
+
+- **055e701**: RFC 7644 §3.4.2.2 filter-expression grammar (`src/filter.rs`). Hand-written
+  tokenizer + recursive-descent parser, no parser-combinator dependency (matches the
+  crate's lean/auditable-dependency-tree design goal). Caught two real bugs via its own
+  test suite before commit: (1) precedence was initially flat left-to-right chaining, not
+  actual "not > and > or" per the spec text -- fixed with a proper precedence-climbing
+  grammar (or-of-ands-of-unary-terms); (2) schema URN version segments like "2.0" in
+  `urn:ietf:params:scim:schemas:core:2.0:User` tokenized as a Number, not an Ident,
+  breaking schema-URI-prefixed attribute paths -- fixed by accepting either token kind
+  for URI segments. 25 tests, including the pre-mortem's addressed high-risk item: a
+  MAX_DEPTH=32 cap on both the paren/logExp recursion path and the value-path bracket
+  path, proven via a programmatically-generated MAX_DEPTH+1 fixture.
+
 ## Council iterations
 
 ## Final summary
