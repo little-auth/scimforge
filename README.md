@@ -44,14 +44,28 @@ recursive with no inherent bound (`valuePath` can contain a filter that contains
 `valuePath`), and since the input is attacker-controlled, an uncapped recursive-descent
 parser is just a stack-overflow DoS with extra steps.
 
+One more spec detail worth calling out because it's easy to get backwards: RFC 7643
+§2.2 says `caseExact` defaults to **false**, meaning case-*insensitive* comparison is
+the spec's stated default, not case-sensitive. Filter matching (`eq`, `co`, `sw`, `ew`)
+folds case unless told otherwise -- I found and fixed a real bug in an early build where
+this was backwards.
+
+## What's here
+
+RFC 7643's Core Schema (User, Group, the Enterprise User extension), RFC 7644's filter
+grammar (§3.4.2.2), full PATCH semantics including schema-driven mutability enforcement
+(§3.5.2), bulk operations with `bulkId` cross-referencing and dependency ordering
+(§3.7), discovery resources (ServiceProviderConfig/ResourceType/Schema, §5-7),
+ListResponse and pagination (§3.4.2), and the Error response shape with all ten
+canonical `scimType` keywords (§3.12, Table 9). 96 tests.
+
 ## Status
 
 Early. Not audited, not yet published to crates.io, and I'd tell you that even if it
 hurt adoption, because it's true and you should know it before you trust it with a
-production directory sync. What exists so far is real and well-tested: the filter
-grammar (25 tests, including the depth-cap fixtures). The rest, schema types, PATCH
-engine, discovery resources, is in progress. Check the commit history, not this README,
-for the current honest state.
+production directory sync. Not yet built: real-IdP-conformance testing against actual
+Okta/Azure AD traffic (tracked in the issues -- needs a live consumer to test against,
+which this standalone library doesn't have yet).
 
 ## License
 
