@@ -101,6 +101,31 @@ pub fn group_schema() -> SchemaResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::find_attribute;
+
+    #[test]
+    fn group_schema_matches_rfc_7643_section_4_2_characteristics() {
+        let schema = group_schema();
+
+        let display_name = find_attribute(&schema, "displayName", None).unwrap();
+        assert!(display_name.required, "displayName is REQUIRED per 4.2");
+
+        let members = find_attribute(&schema, "members", None).unwrap();
+        assert!(members.multi_valued);
+        assert_eq!(
+            members.mutability, "readWrite",
+            "members itself is readWrite -- only its sub-attributes are immutable"
+        );
+
+        for immutable_sub in ["value", "$ref", "display"] {
+            let sub = find_attribute(&schema, "members", Some(immutable_sub))
+                .unwrap_or_else(|| panic!("members.{immutable_sub} must be resolvable"));
+            assert_eq!(
+                sub.mutability, "immutable",
+                "members.{immutable_sub} is immutable per 4.2"
+            );
+        }
+    }
 
     #[test]
     fn deserializes_a_realistic_group_payload_with_nested_group_member() {

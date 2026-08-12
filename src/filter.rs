@@ -783,56 +783,66 @@ mod tests {
         assert!(parse(r#"userName eq {"a":1}"#).is_err());
     }
 
-    /// The core DoS defense this module exists to prove: a filter nested exactly
-    /// [`MAX_DEPTH`] plus one parenthesized groups deep must be rejected with
-    /// [`FilterError::TooDeep`], not overflow the stack. Generated programmatically
-    /// rather than hand-typed so the fixture is provably exactly one level past the
-    /// limit, not "however deep felt sufficient."
-    #[test]
-    fn rejects_filter_nested_past_max_depth() {
+    fn nested_paren_expr(depth: usize) -> String {
         let mut expr = String::new();
-        for _ in 0..(MAX_DEPTH + 5) {
+        for _ in 0..depth {
             expr.push('(');
         }
         expr.push_str("active eq true");
-        for _ in 0..(MAX_DEPTH + 5) {
+        for _ in 0..depth {
             expr.push(')');
         }
-        assert_eq!(parse(&expr), Err(FilterError::TooDeep));
+        expr
     }
 
-    /// The mirror case: nesting comfortably under the limit must still parse
-    /// successfully, proving `MAX_DEPTH` isn't so low it rejects legitimate filters.
+    /// The core DoS defense this module exists to prove, pinned at the exact boundary
+    /// rather than "comfortably past it": nesting of precisely [`MAX_DEPTH`] must still
+    /// parse, and precisely `MAX_DEPTH + 1` must be rejected with
+    /// [`FilterError::TooDeep`]. A test with margin either side (e.g. `MAX_DEPTH + 5`)
+    /// would still pass even if the depth check were off by a few levels in either
+    /// direction -- these two are generated programmatically at the exact values so an
+    /// off-by-N regression in `check_depth`'s comparison can't slip through undetected.
     #[test]
-    fn accepts_filter_nested_well_under_max_depth() {
-        let depth = MAX_DEPTH / 2;
-        let mut expr = String::new();
-        for _ in 0..depth {
-            expr.push('(');
-        }
-        expr.push_str("active eq true");
-        for _ in 0..depth {
-            expr.push(')');
-        }
-        assert!(parse(&expr).is_ok());
+    fn accepts_filter_nested_exactly_at_max_depth() {
+        assert!(parse(&nested_paren_expr(MAX_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn rejects_filter_nested_exactly_one_past_max_depth() {
+        assert_eq!(
+            parse(&nested_paren_expr(MAX_DEPTH + 1)),
+            Err(FilterError::TooDeep)
+        );
     }
 
     /// The same DoS class via nested value-path brackets rather than parens --
     /// `valuePath`'s inner `valFilter` shares the same depth counter (see
     /// `parse_val_filter`'s doc comment), so this must be bounded too, not just the
-    /// paren/logExp path.
-    #[test]
-    fn rejects_value_path_nested_past_max_depth_via_not_groups() {
+    /// paren/logExp path. Also pinned at the exact boundary, not just "comfortably past."
+    fn nested_not_group_value_path_expr(depth: usize) -> String {
         let mut expr = String::from("emails[");
-        for _ in 0..(MAX_DEPTH + 5) {
+        for _ in 0..depth {
             expr.push_str("not (");
         }
         expr.push_str("type pr");
-        for _ in 0..(MAX_DEPTH + 5) {
+        for _ in 0..depth {
             expr.push(')');
         }
         expr.push(']');
-        assert_eq!(parse(&expr), Err(FilterError::TooDeep));
+        expr
+    }
+
+    #[test]
+    fn accepts_value_path_nested_exactly_at_max_depth() {
+        assert!(parse(&nested_not_group_value_path_expr(MAX_DEPTH - 1)).is_ok());
+    }
+
+    #[test]
+    fn rejects_value_path_nested_one_past_max_depth_via_not_groups() {
+        assert_eq!(
+            parse(&nested_not_group_value_path_expr(MAX_DEPTH)),
+            Err(FilterError::TooDeep)
+        );
     }
 
     #[test]
