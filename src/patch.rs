@@ -21,14 +21,23 @@
 //!   this module can't resolve unambiguously against the actual JSON shape returns
 //!   [`PatchError`], not a silent no-op or a silent partial match.
 //!
-//! Not yet covered (tracked as a real scope boundary, not silently skipped): full
-//! per-resource-type schema-driven mutability (e.g. knowing that `User.groups` is
-//! `readOnly` the way `id`/`meta`/`schemas` are universally protected here) requires a
-//! schema-attribute registry this crate doesn't own yet -- only the universal common
-//! attributes are protected in this version.
+//! [`apply_patch_with_schema`] layers a third check on top of the two above: full
+//! per-resource-type mutability, using the same [`crate::discovery::SchemaResource`] that
+//! backs the `/Schemas` discovery endpoint as the single source of truth (see
+//! [`crate::user::user_schema`]'s doc comment for why one document serves both purposes
+//! rather than risking a hand-maintained mutability table drifting out of sync with it).
+//! `readOnly` attributes (e.g. `User.groups`) are rejected outright; `immutable`
+//! attributes (e.g. `Group.members[].display`) may be `add`ed only if they have no
+//! existing value, matching RFC 7644 §3.5.2's exact text: "a client MUST NOT modify an
+//! attribute that has mutability 'readOnly' or 'immutable'... [but] MAY 'add' a value to
+//! an 'immutable' attribute if the attribute had no previous value." [`apply_patch`]
+//! (no schema) still enforces the universal common-attribute protections unconditionally
+//! -- schema-driven checking is additive, not a replacement for that backstop.
 
 use serde_json::{Map, Value};
 
+use crate::common::Mutability;
+use crate::discovery::{self, SchemaResource};
 use crate::filter::{self, CompValue, CompareOp, Filter, FilterError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +71,9 @@ pub enum PatchError {
     /// The path targets a shape apply_patch can't resolve unambiguously against the
     /// actual JSON structure (e.g. a bracket filter against a non-array value).
     AmbiguousPath(String),
+    /// [`apply_patch_with_schema`] only: the path targets an attribute whose schema
+    /// mutability is `readOnly`, or `immutable` with an existing value already present.
+    ImmutableOrReadOnly(String),
 }
 
 impl From<FilterError> for PatchError {
@@ -82,30 +94,126 @@ fn is_protected(attr_name: &str) -> bool {
 /// first error encountered -- `resource` itself is never mutated in place (a clone is
 /// modified internally), so a caller that discards the `Err` case still holds an
 /// untouched original, satisfying RFC 7644's atomicity requirement for this crate's
-/// slice of the problem.
+/// slice of the problem. Enforces only the universal common-attribute protections (`id`,
+/// `meta.*`, `schemas`); for full per-resource-type mutability, use
+/// [`apply_patch_with_schema`].
 pub fn apply_patch(resource: &Value, operations: &[PatchOperation]) -> Result<Value, PatchError> {
+    apply_patch_internal(resource, operations, None)
+}
+
+/// As [`apply_patch`], additionally enforcing `schema`'s per-attribute `readOnly`/
+/// `immutable` mutability (see the module doc). Pass [`crate::user::user_schema`] or
+/// [`crate::group::group_schema`] for the corresponding resource type.
+pub fn apply_patch_with_schema(
+    resource: &Value,
+    operations: &[PatchOperation],
+    schema: &SchemaResource,
+) -> Result<Value, PatchError> {
+    apply_patch_internal(resource, operations, Some(schema))
+}
+
+fn apply_patch_internal(
+    resource: &Value,
+    operations: &[PatchOperation],
+    schema: Option<&SchemaResource>,
+) -> Result<Value, PatchError> {
     let mut working = resource.clone();
     for operation in operations {
-        apply_one(&mut working, operation)?;
+        apply_one(&mut working, operation, schema)?;
     }
     Ok(working)
 }
 
-fn apply_one(resource: &mut Value, operation: &PatchOperation) -> Result<(), PatchError> {
+fn apply_one(
+    resource: &mut Value,
+    operation: &PatchOperation,
+    schema: Option<&SchemaResource>,
+) -> Result<(), PatchError> {
     match operation.op {
-        PatchOp::Remove => apply_remove(resource, operation),
-        PatchOp::Add => apply_add_or_replace(resource, operation, false),
-        PatchOp::Replace => apply_add_or_replace(resource, operation, true),
+        PatchOp::Remove => apply_remove(resource, operation, schema),
+        PatchOp::Add => apply_add_or_replace(resource, operation, false, schema),
+        PatchOp::Replace => apply_add_or_replace(resource, operation, true, schema),
     }
 }
 
-fn apply_remove(resource: &mut Value, operation: &PatchOperation) -> Result<(), PatchError> {
+/// RFC 7644 §3.5.2: "a client MUST NOT modify an attribute that has mutability
+/// 'readOnly' or 'immutable'... [but] MAY 'add' a value to an 'immutable' attribute if
+/// the attribute had no previous value" -- quoted verbatim since the "add exception"
+/// is easy to get subtly wrong (it's `add` specifically, not `add` or `replace`, and only
+/// when no previous value exists).
+///
+/// Precision note for the sub-attribute case (e.g. `members[value eq "x"].display`):
+/// "had no previous value" is checked against whether the *top-level* attribute
+/// (`members`) has any entries at all, not whether the one specific array entry the
+/// bracket filter matches already has that sub-attribute set. This makes the check
+/// conservative (may reject an add RFC 7644 would technically permit) rather than
+/// permissive (never allows one it shouldn't) -- `replace`/`remove` on an immutable
+/// sub-attribute are rejected unconditionally either way, which is the higher-value,
+/// unambiguous case this exists to catch.
+fn check_mutability(
+    schema: &SchemaResource,
+    resource: &Value,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+    op: PatchOp,
+) -> Result<(), PatchError> {
+    let Some(attr_def) = discovery::find_attribute(schema, attr_name, sub_attr) else {
+        // An attribute this schema doesn't know about (an unmodeled extension, say) --
+        // not this function's job to reject what it can't classify.
+        return Ok(());
+    };
+    let mutability =
+        Mutability::from_rfc_str(&attr_def.mutability).unwrap_or(Mutability::ReadWrite);
+    match mutability {
+        Mutability::ReadOnly => Err(PatchError::ImmutableOrReadOnly(attr_name.to_string())),
+        Mutability::Immutable => {
+            let has_existing = op != PatchOp::Add
+                || resource
+                    .get(attr_name)
+                    .is_some_and(|v| !matches!(v, Value::Null));
+            if has_existing {
+                Err(PatchError::ImmutableOrReadOnly(attr_name.to_string()))
+            } else {
+                Ok(())
+            }
+        }
+        Mutability::ReadWrite | Mutability::WriteOnly => Ok(()),
+    }
+}
+
+/// The sub-attribute a mutability check must resolve against, regardless of which of the
+/// two grammatically distinct ways a `PatchPath` carries one: a plain dotted path's own
+/// `attr_path.sub_attr` (`name.familyName`), or a bracket-filtered path's trailing
+/// `sub_attr_after_filter` (`members[value eq "x"].display`). Mixing these up silently
+/// resolves mutability against the *top-level* attribute instead of the sub-attribute --
+/// exactly the bug this helper exists to make impossible to reintroduce at a call site.
+fn effective_sub_attr(path: &filter::PatchPath) -> Option<&str> {
+    path.attr_path
+        .sub_attr
+        .as_deref()
+        .or(path.sub_attr_after_filter.as_deref())
+}
+
+fn apply_remove(
+    resource: &mut Value,
+    operation: &PatchOperation,
+    schema: Option<&SchemaResource>,
+) -> Result<(), PatchError> {
     let Some(path_str) = &operation.path else {
         return Err(PatchError::NoTarget);
     };
     let path = filter::parse_patch_path(path_str)?;
     if is_protected(&path.attr_path.attr_name) {
         return Err(PatchError::Protected(path.attr_path.attr_name.clone()));
+    }
+    if let Some(schema) = schema {
+        check_mutability(
+            schema,
+            resource,
+            &path.attr_path.attr_name,
+            effective_sub_attr(&path),
+            PatchOp::Remove,
+        )?;
     }
     let root = resource.as_object_mut().ok_or_else(|| {
         PatchError::AmbiguousPath("resource root is not a JSON object".to_string())
@@ -167,8 +275,14 @@ fn apply_add_or_replace(
     resource: &mut Value,
     operation: &PatchOperation,
     is_replace: bool,
+    schema: Option<&SchemaResource>,
 ) -> Result<(), PatchError> {
     let value = operation.value.clone().unwrap_or(Value::Null);
+    let op_kind = if is_replace {
+        PatchOp::Replace
+    } else {
+        PatchOp::Add
+    };
 
     let Some(path_str) = &operation.path else {
         // No-path form: value is a set of attributes merged onto the resource root
@@ -181,6 +295,9 @@ fn apply_add_or_replace(
         for key in incoming.keys() {
             if is_protected(key) {
                 return Err(PatchError::Protected(key.clone()));
+            }
+            if let Some(schema) = schema {
+                check_mutability(schema, resource, key, None, op_kind)?;
             }
         }
         let root = resource.as_object_mut().ok_or_else(|| {
@@ -195,6 +312,15 @@ fn apply_add_or_replace(
     let path = filter::parse_patch_path(path_str)?;
     if is_protected(&path.attr_path.attr_name) {
         return Err(PatchError::Protected(path.attr_path.attr_name.clone()));
+    }
+    if let Some(schema) = schema {
+        check_mutability(
+            schema,
+            resource,
+            &path.attr_path.attr_name,
+            effective_sub_attr(&path),
+            op_kind,
+        )?;
     }
     let root = resource.as_object_mut().ok_or_else(|| {
         PatchError::AmbiguousPath("resource root is not a JSON object".to_string())
@@ -564,6 +690,116 @@ mod tests {
         // The original is untouched -- apply_patch never returns the intermediate
         // (first-op-applied) state on a later failure.
         assert_eq!(resource["active"], true);
+    }
+
+    // --- Schema-driven mutability (apply_patch_with_schema) ---
+
+    #[test]
+    fn schema_rejects_replace_targeting_a_readonly_attribute() {
+        // User.groups is readOnly per RFC 7643 4.1.5 -- not one of the three universally
+        // protected common attributes, only catchable via the schema-driven check.
+        let resource = user_with_emails();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("groups"),
+                Some(json!([{"value": "g-1", "display": "Admins"}])),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("groups".to_string()));
+    }
+
+    #[test]
+    fn schema_allows_replace_on_readwrite_attributes_same_as_the_unscoped_check() {
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!(false)))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], false);
+    }
+
+    #[test]
+    fn schema_allows_adding_a_fresh_readwrite_attribute_group_members_itself_is_readwrite() {
+        // Group.members is readWrite (only its sub-attributes value/$ref/display are
+        // immutable) -- confirms the schema check doesn't over-reject a plain readWrite
+        // top-level add.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins"
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some("members"),
+                Some(json!([{"value": "u-1", "type": "User"}])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][0]["value"], "u-1");
+    }
+
+    #[test]
+    fn schema_rejects_replace_on_an_immutable_sub_attribute_that_already_has_a_value() {
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": "u-1", "type": "User", "display": "Alice"}]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"].display"#),
+                Some(json!("Alicia")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("members".to_string()));
+    }
+
+    #[test]
+    fn schema_rejects_no_path_add_that_smuggles_a_readonly_attribute() {
+        let resource = user_with_emails();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                None,
+                Some(json!({"active": false, "groups": [{"value": "g-1"}]})),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("groups".to_string()));
+    }
+
+    #[test]
+    fn apply_patch_without_schema_still_allows_what_schema_would_reject() {
+        // Documents the deliberate difference: apply_patch (no schema) only enforces the
+        // universal common-attribute protections, not User.groups' readOnly status --
+        // apply_patch_with_schema is what adds that.
+        let resource = user_with_emails();
+        let result = apply_patch(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("groups"),
+                Some(json!([{"value": "g-1"}])),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result["groups"][0]["value"], "g-1");
     }
 
     #[test]

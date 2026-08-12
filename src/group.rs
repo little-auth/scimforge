@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::{ExternalId, Meta, ResourceId};
+use crate::discovery::{AttributeDefinition, SchemaResource};
 
 pub const GROUP_SCHEMA_URI: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 
@@ -41,6 +42,60 @@ pub struct Group {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
+}
+
+/// RFC 7643 §4.2's full attribute table -- see [`crate::user::user_schema`]'s doc for why
+/// this is the single source of truth shared with `/Schemas` discovery and
+/// [`crate::patch`]'s mutability enforcement.
+pub fn group_schema() -> SchemaResource {
+    SchemaResource {
+        schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+        id: GROUP_SCHEMA_URI.to_string(),
+        name: Some("Group".to_string()),
+        description: Some("Group".to_string()),
+        attributes: vec![
+            AttributeDefinition {
+                required: true,
+                ..AttributeDefinition::simple(
+                    "displayName",
+                    "string",
+                    "A human-readable name for the Group.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition {
+                multi_valued: true,
+                sub_attributes: vec![
+                    AttributeDefinition::simple(
+                        "value",
+                        "string",
+                        "Identifier of the member of this Group.",
+                        "immutable",
+                    ),
+                    AttributeDefinition::simple(
+                        "$ref",
+                        "reference",
+                        "The URI of the member resource.",
+                        "immutable",
+                    ),
+                    // "display" is immutable per RFC 7643 4.2: settable when a member is
+                    // added, must not change afterward without removing and re-adding.
+                    AttributeDefinition::simple(
+                        "display",
+                        "string",
+                        "A human-readable name for the group member.",
+                        "immutable",
+                    ),
+                ],
+                ..AttributeDefinition::simple(
+                    "members",
+                    "complex",
+                    "A list of members of the Group.",
+                    "readWrite",
+                )
+            },
+        ],
+    }
 }
 
 #[cfg(test)]

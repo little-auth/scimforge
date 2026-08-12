@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::common::{ExternalId, Meta, ResourceId};
+use crate::discovery::{AttributeDefinition, SchemaResource};
 
 pub const USER_SCHEMA_URI: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 pub const ENTERPRISE_USER_SCHEMA_URI: &str =
@@ -185,6 +186,282 @@ pub struct Manager {
     pub ref_: Option<String>,
     #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+}
+
+/// RFC 7643 §4.1's full attribute table as a machine-readable [`SchemaResource`] -- the
+/// single source of truth both for the `/Schemas` discovery endpoint (§7) and for
+/// [`crate::patch`]'s schema-driven mutability enforcement, so the two can never drift
+/// out of sync with each other (a hand-maintained second mutability table next to this
+/// one would be exactly that risk).
+pub fn user_schema() -> SchemaResource {
+    let name_sub = |n: &str, d: &str| AttributeDefinition::simple(n, "string", d, "readWrite");
+    SchemaResource {
+        schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+        id: USER_SCHEMA_URI.to_string(),
+        name: Some("User".to_string()),
+        description: Some("User Account".to_string()),
+        attributes: vec![
+            AttributeDefinition {
+                required: true,
+                uniqueness: "server".to_string(),
+                ..AttributeDefinition::simple(
+                    "userName",
+                    "string",
+                    "Unique identifier for the User, typically used by the user to \
+                     directly authenticate.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition {
+                sub_attributes: vec![
+                    name_sub("formatted", "The full name."),
+                    name_sub("familyName", "The family name."),
+                    name_sub("givenName", "The given name."),
+                    name_sub("middleName", "The middle name(s)."),
+                    name_sub("honorificPrefix", "The honorific prefix(es)."),
+                    name_sub("honorificSuffix", "The honorific suffix(es)."),
+                ],
+                ..AttributeDefinition::simple(
+                    "name",
+                    "complex",
+                    "The components of the user's real name.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition::simple(
+                "displayName",
+                "string",
+                "The name of the User, suitable for display.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "nickName",
+                "string",
+                "The casual way to address the user.",
+                "readWrite",
+            ),
+            AttributeDefinition {
+                type_: "reference".to_string(),
+                case_exact: true,
+                reference_types: vec!["external".to_string()],
+                ..AttributeDefinition::simple(
+                    "profileUrl",
+                    "reference",
+                    "A URI that is a URL to the user's online profile.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition::simple("title", "string", "The user's title.", "readWrite"),
+            AttributeDefinition::simple(
+                "userType",
+                "string",
+                "Used to identify the relationship between the organization and the user.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "preferredLanguage",
+                "string",
+                "Indicates the User's preferred written or spoken language.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "locale",
+                "string",
+                "Used to indicate the User's default location.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple("timezone", "string", "The User's time zone.", "readWrite"),
+            AttributeDefinition::simple(
+                "active",
+                "boolean",
+                "A Boolean value indicating the User's administrative status.",
+                "readWrite",
+            ),
+            AttributeDefinition {
+                mutability: "writeOnly".to_string(),
+                returned: "never".to_string(),
+                ..AttributeDefinition::simple(
+                    "password",
+                    "string",
+                    "The User's clear text password.",
+                    "writeOnly",
+                )
+            },
+            multi_valued_string_attr("emails", "Email addresses for the user.", "readWrite"),
+            multi_valued_string_attr("phoneNumbers", "Phone numbers for the User.", "readWrite"),
+            multi_valued_string_attr(
+                "ims",
+                "Instant messaging addresses for the User.",
+                "readWrite",
+            ),
+            AttributeDefinition {
+                multi_valued: true,
+                type_: "reference".to_string(),
+                reference_types: vec!["external".to_string()],
+                ..AttributeDefinition::simple(
+                    "photos",
+                    "reference",
+                    "URLs of photos of the User.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition {
+                multi_valued: true,
+                sub_attributes: vec![
+                    name_sub("formatted", "The full mailing address."),
+                    name_sub("streetAddress", "The street address."),
+                    name_sub("locality", "The city or locality."),
+                    name_sub("region", "The state or region."),
+                    name_sub("postalCode", "The zip code or postal code."),
+                    name_sub("country", "The country name."),
+                ],
+                ..AttributeDefinition::simple(
+                    "addresses",
+                    "complex",
+                    "A physical mailing address for this User.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition {
+                multi_valued: true,
+                mutability: "readOnly".to_string(),
+                sub_attributes: vec![
+                    AttributeDefinition::simple(
+                        "value",
+                        "string",
+                        "The identifier of the User's group.",
+                        "readOnly",
+                    ),
+                    AttributeDefinition::simple(
+                        "display",
+                        "string",
+                        "A human-readable name for the Group.",
+                        "readOnly",
+                    ),
+                ],
+                ..AttributeDefinition::simple(
+                    "groups",
+                    "complex",
+                    "A list of groups that the user belongs to.",
+                    "readOnly",
+                )
+            },
+            AttributeDefinition {
+                multi_valued: true,
+                ..AttributeDefinition::simple(
+                    "entitlements",
+                    "string",
+                    "A list of entitlements for the User.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition {
+                multi_valued: true,
+                ..AttributeDefinition::simple(
+                    "roles",
+                    "string",
+                    "A list of roles for the User.",
+                    "readWrite",
+                )
+            },
+            AttributeDefinition {
+                multi_valued: true,
+                type_: "binary".to_string(),
+                ..AttributeDefinition::simple(
+                    "x509Certificates",
+                    "binary",
+                    "A list of certificates issued to the User.",
+                    "readWrite",
+                )
+            },
+        ],
+    }
+}
+
+fn multi_valued_string_attr(
+    name: &str,
+    description: &str,
+    mutability: &str,
+) -> AttributeDefinition {
+    AttributeDefinition {
+        multi_valued: true,
+        sub_attributes: vec![
+            AttributeDefinition::simple("value", "string", "The value.", mutability),
+            AttributeDefinition::simple("type", "string", "The type of value.", mutability),
+            AttributeDefinition::simple(
+                "primary",
+                "boolean",
+                "Whether this is the primary value.",
+                mutability,
+            ),
+            AttributeDefinition::simple("display", "string", "A human-readable value.", mutability),
+        ],
+        ..AttributeDefinition::simple(name, "complex", description, mutability)
+    }
+}
+
+/// RFC 7643 §4.3's full attribute table.
+pub fn enterprise_user_schema() -> SchemaResource {
+    SchemaResource {
+        schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+        id: ENTERPRISE_USER_SCHEMA_URI.to_string(),
+        name: Some("EnterpriseUser".to_string()),
+        description: Some("Enterprise User".to_string()),
+        attributes: vec![
+            AttributeDefinition::simple(
+                "employeeNumber",
+                "string",
+                "Numeric or alphanumeric identifier assigned to a person.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "costCenter",
+                "string",
+                "Identifies the name of a cost center.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "organization",
+                "string",
+                "Identifies the name of an organization.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "division",
+                "string",
+                "Identifies the name of a division.",
+                "readWrite",
+            ),
+            AttributeDefinition::simple(
+                "department",
+                "string",
+                "Identifies the name of a department.",
+                "readWrite",
+            ),
+            AttributeDefinition {
+                sub_attributes: vec![
+                    AttributeDefinition::simple(
+                        "value",
+                        "string",
+                        "The id of the SCIM resource representing the user's manager.",
+                        "readWrite",
+                    ),
+                    AttributeDefinition::simple(
+                        "displayName",
+                        "string",
+                        "The displayName of the user's manager.",
+                        "readOnly",
+                    ),
+                ],
+                ..AttributeDefinition::simple(
+                    "manager",
+                    "complex",
+                    "The user's manager.",
+                    "readWrite",
+                )
+            },
+        ],
+    }
 }
 
 #[cfg(test)]

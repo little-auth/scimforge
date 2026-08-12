@@ -123,6 +123,51 @@ pub struct AttributeDefinition {
     pub reference_types: Vec<String>,
 }
 
+impl AttributeDefinition {
+    /// The common case: a non-multi-valued, non-required, case-insensitive,
+    /// no-uniqueness, default-returned attribute -- which covers most of RFC 7643's
+    /// §4.1/§4.2 attribute table. Override specific fields via struct-update syntax
+    /// (`AttributeDefinition { required: true, ..AttributeDefinition::simple(...) }`)
+    /// for the attributes that differ.
+    pub fn simple(name: &str, type_: &str, description: &str, mutability: &str) -> Self {
+        AttributeDefinition {
+            name: name.to_string(),
+            type_: type_.to_string(),
+            multi_valued: false,
+            description: description.to_string(),
+            required: false,
+            canonical_values: vec![],
+            case_exact: false,
+            mutability: mutability.to_string(),
+            returned: "default".to_string(),
+            uniqueness: "none".to_string(),
+            sub_attributes: vec![],
+            reference_types: vec![],
+        }
+    }
+}
+
+/// Looks up an attribute (optionally a sub-attribute) by name, case-insensitively per
+/// RFC 7643 attribute-naming rules -- used by [`crate::patch`]'s schema-driven mutability
+/// enforcement.
+pub fn find_attribute<'a>(
+    schema: &'a SchemaResource,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+) -> Option<&'a AttributeDefinition> {
+    let top = schema
+        .attributes
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(attr_name))?;
+    match sub_attr {
+        Some(sub) => top
+            .sub_attributes
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(sub)),
+        None => Some(top),
+    }
+}
+
 /// RFC 7643 §7. "Schema resources are read-only."
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaResource {
