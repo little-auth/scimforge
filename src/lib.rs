@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bulk;
 pub mod common;
 pub mod discovery;
 pub mod filter;
