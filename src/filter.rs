@@ -109,6 +109,61 @@ impl fmt::Display for FilterError {
 
 impl std::error::Error for FilterError {}
 
+/// RFC 7644 §3.5.2 PATCH `path` grammar: `PATH = attrPath / valuePath [subAttr]`. Shares
+/// the exact same `attrPath`/`valuePath`/`valFilter` productions as a search filter (see
+/// the module doc), so this reuses [`parse`]'s tokenizer and attr-path/val-filter
+/// parsing rather than re-implementing them -- including the same [`MAX_DEPTH`] bound,
+/// since a PATCH path's bracket filter is just as attacker-reachable as a search filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatchPath {
+    pub attr_path: AttrPath,
+    /// The `[valFilter]` scoping which entries of a multi-valued attribute this path
+    /// targets, if the path has one (e.g. `type eq "work"` in `emails[type eq "work"]`).
+    pub value_filter: Option<Filter>,
+    /// A `.subAttr` immediately after the closing `]`, e.g. `.streetAddress` in
+    /// `addresses[type eq "work"].streetAddress`. Only meaningful when
+    /// `value_filter` is `Some`; a bare `attrPath`'s own sub-attribute (e.g.
+    /// `name.familyName`, no brackets at all) already lives on `attr_path.sub_attr`.
+    pub sub_attr_after_filter: Option<String>,
+}
+
+pub fn parse_patch_path(input: &str) -> Result<PatchPath, FilterError> {
+    let tokens = tokenize(input)?;
+    let mut parser = Parser {
+        tokens: &tokens,
+        pos: 0,
+    };
+    let attr_path = parser.parse_attr_path()?;
+    let (value_filter, sub_attr_after_filter) = if matches!(parser.peek(), Some(Token::LBracket)) {
+        parser.advance();
+        let inner = parser.parse_val_filter(1)?;
+        parser.expect(Token::RBracket)?;
+        let trailing = if matches!(parser.peek(), Some(Token::Dot)) {
+            parser.advance();
+            match parser.advance() {
+                Some(Token::Ident(s)) => Some(s.clone()),
+                other => return Err(FilterError::UnexpectedToken(format!("{other:?}"))),
+            }
+        } else {
+            None
+        };
+        (Some(inner), trailing)
+    } else {
+        (None, None)
+    };
+    if parser.pos != parser.tokens.len() {
+        return Err(FilterError::UnexpectedToken(format!(
+            "{:?}",
+            parser.tokens[parser.pos]
+        )));
+    }
+    Ok(PatchPath {
+        attr_path,
+        value_filter,
+        sub_attr_after_filter,
+    })
+}
+
 pub fn parse(input: &str) -> Result<Filter, FilterError> {
     let tokens = tokenize(input)?;
     let mut parser = Parser {
@@ -785,6 +840,63 @@ mod tests {
         // Not a crash, not a silent misparse -- `pr` with a trailing junk value token is
         // simply a malformed filter.
         assert!(parse(r#"active pr "unexpected""#).is_err());
+    }
+
+    #[test]
+    fn patch_path_parses_a_bare_attr_path() {
+        let p = parse_patch_path("displayName").unwrap();
+        assert_eq!(p.attr_path, attr("displayName"));
+        assert_eq!(p.value_filter, None);
+        assert_eq!(p.sub_attr_after_filter, None);
+    }
+
+    #[test]
+    fn patch_path_parses_a_dotted_sub_attribute_with_no_brackets() {
+        let p = parse_patch_path("name.familyName").unwrap();
+        assert_eq!(p.attr_path.attr_name, "name");
+        assert_eq!(p.attr_path.sub_attr.as_deref(), Some("familyName"));
+        assert_eq!(p.value_filter, None);
+    }
+
+    #[test]
+    fn patch_path_parses_a_bracket_filter_with_no_trailing_sub_attr() {
+        let p = parse_patch_path(r#"emails[type eq "work"]"#).unwrap();
+        assert_eq!(p.attr_path, attr("emails"));
+        assert_eq!(
+            p.value_filter,
+            Some(Filter::Compare(
+                attr("type"),
+                CompareOp::Eq,
+                CompValue::String("work".to_string())
+            ))
+        );
+        assert_eq!(p.sub_attr_after_filter, None);
+    }
+
+    #[test]
+    fn patch_path_parses_a_bracket_filter_with_trailing_sub_attr() {
+        let p = parse_patch_path(r#"addresses[type eq "work"].streetAddress"#).unwrap();
+        assert_eq!(p.attr_path, attr("addresses"));
+        assert_eq!(p.sub_attr_after_filter.as_deref(), Some("streetAddress"));
+    }
+
+    #[test]
+    fn patch_path_rejects_trailing_garbage() {
+        assert!(parse_patch_path(r#"emails[type eq "work"] extra"#).is_err());
+    }
+
+    #[test]
+    fn patch_path_bracket_filter_is_still_depth_bounded() {
+        let mut expr = String::from("emails[");
+        for _ in 0..(MAX_DEPTH + 5) {
+            expr.push_str("not (");
+        }
+        expr.push_str("type pr");
+        for _ in 0..(MAX_DEPTH + 5) {
+            expr.push(')');
+        }
+        expr.push(']');
+        assert_eq!(parse_patch_path(&expr), Err(FilterError::TooDeep));
     }
 
     #[test]
