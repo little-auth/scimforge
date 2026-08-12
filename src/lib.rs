@@ -9,4 +9,5 @@
 pub mod common;
 pub mod filter;
 pub mod group;
+pub mod patch;
 pub mod user;
