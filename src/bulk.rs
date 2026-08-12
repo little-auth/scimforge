@@ -153,6 +153,33 @@ pub enum BulkError {
     TooLarge(String),
 }
 
+impl BulkError {
+    /// The three `bulkId`-shape errors are request-syntax problems RFC 7644 §3.12 Table
+    /// 9 classifies as `invalidValue` (400); `CircularReference` maps to 409 per §3.7.1's
+    /// own text, which specifies the status code directly and doesn't assign it a
+    /// `scimType` at all; `TooLarge` maps to 413 per §3.7.4, likewise with no `scimType`
+    /// (§3.7.4's example body is `{"maxOperations": ..., "maxPayloadSize": ...}`, not the
+    /// `schemas`/`scimType`/`detail` Error shape).
+    pub fn scim_type(&self) -> Option<crate::error::ScimType> {
+        match self {
+            BulkError::MissingBulkIdOnPost(_)
+            | BulkError::DuplicateBulkId(_)
+            | BulkError::UnresolvedBulkId(_) => Some(crate::error::ScimType::InvalidValue),
+            BulkError::CircularReference | BulkError::TooLarge(_) => None,
+        }
+    }
+
+    pub fn http_status(&self) -> u16 {
+        match self {
+            BulkError::MissingBulkIdOnPost(_)
+            | BulkError::DuplicateBulkId(_)
+            | BulkError::UnresolvedBulkId(_) => 400,
+            BulkError::CircularReference => 409,
+            BulkError::TooLarge(_) => 413,
+        }
+    }
+}
+
 /// Validates §3.7.4's limits. `payload_size_bytes` is the caller's own measurement of
 /// the raw request body (this crate never sees raw bytes, only the parsed structure).
 pub fn check_limits(
@@ -550,6 +577,20 @@ mod tests {
         };
         let err = check_limits(&req, 1000, 1_048_576, 5_000_000_000).unwrap_err();
         assert!(matches!(err, BulkError::TooLarge(_)));
+    }
+
+    #[test]
+    fn bulk_error_maps_to_the_correct_http_status_per_rfc_7644() {
+        assert_eq!(BulkError::CircularReference.http_status(), 409);
+        assert_eq!(BulkError::TooLarge("x".to_string()).http_status(), 413);
+        assert_eq!(
+            BulkError::DuplicateBulkId("x".to_string()).http_status(),
+            400
+        );
+        // 3.7.1's circular-reference status and 3.7.4's too-large body shape both have
+        // no scimType in the spec text -- confirms this crate doesn't invent one.
+        assert_eq!(BulkError::CircularReference.scim_type(), None);
+        assert_eq!(BulkError::TooLarge("x".to_string()).scim_type(), None);
     }
 
     #[test]

@@ -38,6 +38,7 @@ use serde_json::{Map, Value};
 
 use crate::common::Mutability;
 use crate::discovery::{self, SchemaResource};
+use crate::error::ScimType;
 use crate::filter::{self, CompValue, CompareOp, Filter, FilterError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,26 @@ pub enum PatchError {
 impl From<FilterError> for PatchError {
     fn from(e: FilterError) -> Self {
         PatchError::InvalidPath(e)
+    }
+}
+
+impl PatchError {
+    /// RFC 7644 §3.12 Table 9's canonical `scimType` for this failure -- every variant
+    /// maps to a 400 (Bad Request) per the table, since PATCH errors are all
+    /// request-shape/semantics problems, never a different status class.
+    pub fn scim_type(&self) -> ScimType {
+        match self {
+            PatchError::NoTarget => ScimType::NoTarget,
+            PatchError::Protected(_) => ScimType::Mutability,
+            PatchError::InvalidPath(_) => ScimType::InvalidPath,
+            PatchError::NoMatchingValue => ScimType::NoTarget,
+            PatchError::AmbiguousPath(_) => ScimType::InvalidPath,
+            PatchError::ImmutableOrReadOnly(_) => ScimType::Mutability,
+        }
+    }
+
+    pub fn http_status(&self) -> u16 {
+        400
     }
 }
 
@@ -423,19 +444,28 @@ fn resolve_scalar<'a>(path: &crate::filter::AttrPath, value: &'a Value) -> Optio
     }
 }
 
+/// RFC 7643 §2.2: `caseExact` "OPTIONAL... DEFAULT: false" -- case-*insensitive* is the
+/// spec's stated default, not an implementation nicety, so string equality/substring
+/// comparisons fold case unless the caller knows better. (A schema-aware caller wanting
+/// per-attribute `caseExact` overrides isn't implemented yet -- this default just needs
+/// to stop being wrong first; see the Follow-ups in the ticket for the schema-threaded
+/// version.)
 fn compare(actual: &Value, op: &CompareOp, expected: &CompValue) -> bool {
     match (actual, expected) {
-        (Value::String(a), CompValue::String(b)) => match op {
-            CompareOp::Eq => a == b,
-            CompareOp::Ne => a != b,
-            CompareOp::Co => a.contains(b.as_str()),
-            CompareOp::Sw => a.starts_with(b.as_str()),
-            CompareOp::Ew => a.ends_with(b.as_str()),
-            CompareOp::Gt => a > b,
-            CompareOp::Ge => a >= b,
-            CompareOp::Lt => a < b,
-            CompareOp::Le => a <= b,
-        },
+        (Value::String(a), CompValue::String(b)) => {
+            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            match op {
+                CompareOp::Eq => a == b,
+                CompareOp::Ne => a != b,
+                CompareOp::Co => a.contains(&b),
+                CompareOp::Sw => a.starts_with(&b),
+                CompareOp::Ew => a.ends_with(&b),
+                CompareOp::Gt => a > b,
+                CompareOp::Ge => a >= b,
+                CompareOp::Lt => a < b,
+                CompareOp::Le => a <= b,
+            }
+        }
         (Value::Number(a), CompValue::Number(b, _)) => {
             let a = a.as_f64().unwrap_or(f64::NAN);
             match op {
@@ -800,6 +830,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["groups"][0]["value"], "g-1");
+    }
+
+    #[test]
+    fn patch_error_maps_to_the_rfc_7644_table_9_scim_type() {
+        assert_eq!(PatchError::NoTarget.scim_type(), ScimType::NoTarget);
+        assert_eq!(
+            PatchError::Protected("id".to_string()).scim_type(),
+            ScimType::Mutability
+        );
+        assert_eq!(
+            PatchError::ImmutableOrReadOnly("groups".to_string()).scim_type(),
+            ScimType::Mutability
+        );
+        assert_eq!(PatchError::NoMatchingValue.scim_type(), ScimType::NoTarget);
+    }
+
+    #[test]
+    fn bracket_filter_matching_is_case_insensitive_by_default() {
+        // RFC 7643 2.2: caseExact "DEFAULT: false" -- a filter value's case must not
+        // matter unless the crate is told the attribute is caseExact.
+        let resource = user_with_emails();
+        let result = apply_patch(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"emails[type eq "WORK"].value"#),
+                Some(json!("new@example.com")),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result["emails"][0]["value"], "new@example.com");
     }
 
     #[test]
