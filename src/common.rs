@@ -64,6 +64,20 @@ pub enum Mutability {
     WriteOnly,
 }
 
+impl Mutability {
+    /// Parses the exact lowercase string RFC 7643 §2.2 defines for this characteristic
+    /// (as stored in [`crate::discovery::AttributeDefinition::mutability`]).
+    pub fn from_rfc_str(s: &str) -> Option<Self> {
+        match s {
+            "readOnly" => Some(Mutability::ReadOnly),
+            "readWrite" => Some(Mutability::ReadWrite),
+            "immutable" => Some(Mutability::Immutable),
+            "writeOnly" => Some(Mutability::WriteOnly),
+            _ => None,
+        }
+    }
+}
+
 /// RFC 7643 §2.2 `returned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Returned {
@@ -127,6 +141,28 @@ mod tests {
         let id = ResourceId::new("1");
         let ext = ExternalId::new("1");
         assert_eq!(id.as_str(), ext.as_str());
+    }
+
+    #[test]
+    fn mutability_from_rfc_str_parses_all_four_values() {
+        assert_eq!(
+            Mutability::from_rfc_str("readOnly"),
+            Some(Mutability::ReadOnly)
+        );
+        assert_eq!(
+            Mutability::from_rfc_str("readWrite"),
+            Some(Mutability::ReadWrite)
+        );
+        assert_eq!(
+            Mutability::from_rfc_str("immutable"),
+            Some(Mutability::Immutable)
+        );
+        assert_eq!(
+            Mutability::from_rfc_str("writeOnly"),
+            Some(Mutability::WriteOnly)
+        );
+        assert_eq!(Mutability::from_rfc_str("ReadOnly"), None);
+        assert_eq!(Mutability::from_rfc_str("bogus"), None);
     }
 
     #[test]
