@@ -10,5 +10,6 @@ pub mod common;
 pub mod discovery;
 pub mod filter;
 pub mod group;
+pub mod list_response;
 pub mod patch;
 pub mod user;
