@@ -1,0 +1,24 @@
+[package]
+name = "scimitar"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "SCIM 2.0 (RFC 7643/7644) server-side protocol implementation: schema, filter grammar, PATCH semantics, bulk operations -- storage-agnostic."
+repository = "https://github.com/mario/scimitar"
+readme = "README.md"
+keywords = ["scim", "provisioning", "identity", "rfc7644", "rfc7643"]
+categories = ["authentication", "web-programming"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
