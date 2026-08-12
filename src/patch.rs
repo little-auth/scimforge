@@ -125,6 +125,14 @@ pub fn apply_patch(resource: &Value, operations: &[PatchOperation]) -> Result<Va
 /// As [`apply_patch`], additionally enforcing `schema`'s per-attribute `readOnly`/
 /// `immutable` mutability (see the module doc). Pass [`crate::user::user_schema`] or
 /// [`crate::group::group_schema`] for the corresponding resource type.
+///
+/// Takes exactly one schema: for a resource with an active extension (e.g. a User with
+/// the Enterprise User extension), extension-only attributes like `manager.displayName`
+/// won't be covered by mutability enforcement unless the caller merges the extension's
+/// attributes into the schema passed here (`user_schema().attributes.into_iter().chain(
+/// crate::user::enterprise_user_schema().attributes)`) -- this crate doesn't merge them
+/// automatically, since it has no way to know which extensions are actually active for
+/// a given resource without the caller telling it.
 pub fn apply_patch_with_schema(
     resource: &Value,
     operations: &[PatchOperation],

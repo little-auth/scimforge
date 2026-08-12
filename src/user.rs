@@ -467,6 +467,86 @@ pub fn enterprise_user_schema() -> SchemaResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::find_attribute;
+
+    /// `user_schema()`/`enterprise_user_schema()` are large, hand-transcribed data
+    /// structures -- everything else that exercises them (patch.rs's schema-driven
+    /// mutability tests) only incidentally touches a handful of attributes (`groups`,
+    /// `active`). This asserts the actual RFC 7643 §4.1/§4.3 characteristics directly,
+    /// attribute by attribute, so a transcription error elsewhere in the list (a wrong
+    /// mutability, a missing `multi_valued`, a `required` that shouldn't be) doesn't go
+    /// silently uncaught.
+    #[test]
+    fn user_schema_matches_rfc_7643_section_4_1_characteristics() {
+        let schema = user_schema();
+
+        let user_name = find_attribute(&schema, "userName", None).unwrap();
+        assert!(user_name.required, "userName is REQUIRED per 4.1");
+        assert_eq!(user_name.uniqueness, "server");
+
+        let name = find_attribute(&schema, "name", None).unwrap();
+        assert_eq!(name.type_, "complex");
+        assert!(!name.multi_valued);
+        assert!(
+            find_attribute(&schema, "name", Some("familyName")).is_some(),
+            "name.familyName must be a resolvable sub-attribute"
+        );
+
+        let active = find_attribute(&schema, "active", None).unwrap();
+        assert_eq!(active.type_, "boolean");
+
+        let password = find_attribute(&schema, "password", None).unwrap();
+        assert_eq!(password.mutability, "writeOnly");
+        assert_eq!(password.returned, "never");
+
+        let groups = find_attribute(&schema, "groups", None).unwrap();
+        assert_eq!(groups.mutability, "readOnly");
+        assert!(groups.multi_valued);
+
+        let profile_url = find_attribute(&schema, "profileUrl", None).unwrap();
+        assert_eq!(profile_url.type_, "reference");
+        assert!(
+            profile_url.case_exact,
+            "profileUrl is explicitly caseExact: true per 4.1"
+        );
+
+        for multi_valued_name in ["emails", "phoneNumbers", "ims", "addresses"] {
+            let attr = find_attribute(&schema, multi_valued_name, None)
+                .unwrap_or_else(|| panic!("{multi_valued_name} must exist in user_schema()"));
+            assert!(attr.multi_valued, "{multi_valued_name} must be multiValued");
+        }
+
+        let x509 = find_attribute(&schema, "x509Certificates", None).unwrap();
+        assert_eq!(x509.type_, "binary");
+        assert!(x509.multi_valued);
+
+        // Lookup for an attribute this schema genuinely doesn't have must be None, not
+        // panic or silently match something else.
+        assert!(find_attribute(&schema, "notARealAttribute", None).is_none());
+    }
+
+    #[test]
+    fn enterprise_user_schema_matches_rfc_7643_section_4_3_characteristics() {
+        let schema = enterprise_user_schema();
+        for readwrite_string_attr in [
+            "employeeNumber",
+            "costCenter",
+            "organization",
+            "division",
+            "department",
+        ] {
+            let attr = find_attribute(&schema, readwrite_string_attr, None)
+                .unwrap_or_else(|| panic!("{readwrite_string_attr} must exist"));
+            assert_eq!(attr.mutability, "readWrite");
+            assert_eq!(attr.type_, "string");
+        }
+
+        let manager = find_attribute(&schema, "manager", None).unwrap();
+        assert_eq!(manager.type_, "complex");
+        let manager_display_name = find_attribute(&schema, "manager", Some("displayName"))
+            .expect("manager.displayName must be a resolvable sub-attribute");
+        assert_eq!(manager_display_name.mutability, "readOnly");
+    }
 
     fn minimal_user() -> User {
         User {
