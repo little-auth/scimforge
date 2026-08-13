@@ -22,6 +22,11 @@ pub struct ListResponse<T> {
 }
 
 impl<T> ListResponse<T> {
+    /// `items_per_page` is derived from `resources.len()`, not a separate parameter --
+    /// RFC 7644 §3.4.2's `itemsPerPage` is defined as the count actually returned on this
+    /// page, so there's no independent value for a caller to get out of sync with the
+    /// `resources` it's also passing in. `total_results` (the count across every page,
+    /// not just this one) has no such derivation and is the caller's own to supply.
     pub fn new(resources: Vec<T>, total_results: u64, start_index: u64) -> Self {
         let items_per_page = resources.len() as u64;
         ListResponse {

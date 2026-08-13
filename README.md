@@ -71,6 +71,98 @@ evaluator doesn't have to re-derive RFC 7643's rules by hand. (The link above wi
 until this crate ships to crates.io -- see Status below -- but it's the right link once
 it does, so it stays.)
 
+## Quickstart
+
+This is real, compiled-and-tested code (`cargo test --doc` runs it, since this README is
+also the crate's rustdoc front page). It's not the whole API -- see the module docs
+(`cargo doc --open`) for bulk operations, discovery resources, and the rest.
+
+```rust
+use scimitar::discovery::is_case_exact;
+use scimitar::filter;
+use scimitar::patch::{apply_patch, PatchOp, PatchOperation};
+use scimitar::user::{User, USER_SCHEMA_URI};
+use serde_json::json;
+
+// Parse an incoming SCIM User creation request the way a real IdP actually sends one --
+// deserialized straight off the wire, not hand-built.
+let user: User = serde_json::from_value(json!({
+    "schemas": [USER_SCHEMA_URI],
+    "userName": "bjensen@example.com",
+    "name": {"givenName": "Barbara", "familyName": "Jensen"},
+    "emails": [{"value": "bjensen@example.com", "type": "work", "primary": true}],
+    "active": true
+}))
+.unwrap();
+assert_eq!(user.user_name, "bjensen@example.com");
+
+// Parse a search filter against RFC 7644 §3.4.2.2's actual grammar, not a string match
+// against the raw query parameter (see "Why this exists" above for what that costs you).
+let parsed = filter::parse(r#"userName eq "bjensen@example.com" and active eq true"#).unwrap();
+assert!(matches!(parsed, filter::Filter::And(_, _)));
+
+// Apply a PATCH request (RFC 7644 §3.5.2) to the resource's own JSON representation.
+let resource = serde_json::to_value(&user).unwrap();
+let patched = apply_patch(
+    &resource,
+    &[PatchOperation {
+        op: PatchOp::Replace,
+        path: Some(r#"emails[type eq "work"].value"#.to_string()),
+        value: Some(json!("bjensen+updated@example.com")),
+    }],
+)
+.unwrap();
+assert_eq!(patched["emails"][0]["value"], "bjensen+updated@example.com");
+
+// id/externalId/meta.resourceType/meta.version are caseExact per RFC 7643 §3.1, even
+// though no per-resource schema declares them -- is_case_exact resolves that for you.
+assert!(is_case_exact(None, None, "externalId", None));
+```
+
+`apply_patch` only enforces the universal protections (`id`, `meta.*`, `schemas` are
+never touchable). Pass a resource's schema to `apply_patch_with_schema` for full
+per-attribute mutability -- `readOnly` attributes rejected outright, `immutable`
+attributes only addable when they have no existing value yet -- using the exact same
+`SchemaResource` that answers `/Schemas`, so the two can't drift out of sync with each
+other:
+
+```rust
+use scimitar::patch::{apply_patch_with_schema, PatchError, PatchOp, PatchOperation};
+use scimitar::user::user_schema;
+use serde_json::json;
+
+let schema = user_schema();
+assert_eq!(
+    serde_json::to_value(&schema).unwrap()["id"],
+    "urn:ietf:params:scim:schemas:core:2.0:User"
+);
+
+// User.groups is readOnly (RFC 7643 §4.1.5): a client can't grant itself group
+// membership through PATCH, only through the Group resource's own `members`.
+// apply_patch (no schema) can't catch this; apply_patch_with_schema does.
+let resource = json!({
+    "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+    "userName": "bjensen"
+});
+let err = apply_patch_with_schema(
+    &resource,
+    &[PatchOperation {
+        op: PatchOp::Replace,
+        path: Some("groups".to_string()),
+        value: Some(json!([{"value": "g-1", "display": "Admins"}])),
+    }],
+    &schema,
+)
+.unwrap_err();
+assert_eq!(err, PatchError::ImmutableOrReadOnly("groups".to_string()));
+```
+
+Two longer, narrated walkthroughs live in `examples/`: `apply_patch.rs` (a full PATCH
+request with both an accepted and a schema-rejected operation, turned into the RFC 7644
+§3.12 Error response shape) and `filter_and_mutability.rs` (parsing a filter, resolving
+`caseExact`, and the immutable-attribute add-if-absent exception on a Group). Run either
+with `cargo run --example apply_patch`.
+
 ## What's here
 
 RFC 7643's Core Schema (User, Group, the Enterprise User extension), RFC 7644's filter
@@ -90,5 +182,10 @@ which this standalone library doesn't have yet).
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of
+[Apache License, Version 2.0](https://github.com/mario/scimitar/blob/main/LICENSE-APACHE)
+or [MIT license](https://github.com/mario/scimitar/blob/main/LICENSE-MIT) at your option.
+(Relative links here would break once this README doubles as the crate's rustdoc front
+page via `#![doc = include_str!(...)]` -- rustdoc doesn't check plain markdown hyperlinks
+to local files the way it checks intra-doc `[`Type`]` links, so a relative path here would
+silently 404 on docs.rs without CI ever catching it.)
