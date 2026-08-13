@@ -72,7 +72,38 @@ source-reading approach missed.
 
 ## Findings from actually running it (not derivable from reading source alone)
 
-The live CI run surfaced two things no amount of source-reading caught:
+The live CI run surfaced four things no amount of source-reading caught:
+
+- **The plugin NullPointerExceptions on every single Admin-API user DELETE.**
+  `ScimEventListenerProvider.onEvent(AdminEvent, boolean)`'s `DELETE` branch calls
+  `getUser(userId)` to check `user.isEmailVerified()` before dispatching -- the same
+  pattern the `CREATE`/`UPDATE` branches use. But by the time the `DELETE` admin event
+  fires, Keycloak has already removed that user's row: `getUser` always returns `null`,
+  and the unchecked `user.isEmailVerified()` call throws
+  `NullPointerException: Cannot invoke "org.keycloak.models.UserModel.isEmailVerified()"
+  because "user" is null` at `ScimEventListenerProvider.java:87`, every time, for every
+  delete. Confirmed both in CI (`KC-SERVICES0085: Failed to send type to
+  ScimEventListenerProvider`) and reproduced locally against a live Keycloak +
+  freshly-built plugin image, not inferred from the CI log alone. The plugin's own event
+  listener crashes before it ever builds the outbound SCIM request -- no DELETE reaches
+  a configured service provider under this plugin version, full stop, no matter how a
+  caller is configured or how long it waits.
+
+  The plugin's own code already has the right pattern for this exact situation: the
+  self-service `EventType.DELETE_ACCOUNT` branch a few lines above in the same file
+  dispatches unconditionally, no `isEmailVerified()` check at all, since
+  `ScimClient.delete()` already has its own safe no-op for a user that was never synced
+  (a JPA lookup against its local mapping table, catching `NoResultException`). The
+  Admin-API `DELETE` branch just didn't apply that same pattern consistently.
+
+  Not a `scimitar` bug and not something to work around by loosening validation --
+  `docker/patches/0001-fix-delete-npe.patch` fixes it directly in a locally-built plugin
+  image (applied via `git apply` in `Dockerfile.keycloak-scim`, see the patch file's own
+  header for the full writeup), so this harness's live conformance test can actually
+  prove the full create/update/delete lifecycle instead of giving up on a third of it.
+  Filed upstream at [mitodl/keycloak-scim#TBD](https://github.com/mitodl/keycloak-scim) --
+  remove the patch and the `git apply` step once an equivalent fix lands there and this
+  harness's pinned `KEYCLOAK_SCIM_COMMIT` moves past it.
 
 - **The plugin gates every SCIM push on the Keycloak user's `emailVerified` flag.**
   `ScimEventListenerProvider.onEvent(AdminEvent, boolean)` -- the handler for
@@ -95,6 +126,18 @@ The live CI run surfaced two things no amount of source-reading caught:
   `keycloak-scim-1.0-SNAPSHOT-all.jar`. Fixed by naming the build directory
   `/keycloak-scim` to match. Not a scimitar or protocol finding, but a genuine "only a
   real build run would catch this" result.
+- **The plugin sends a full PUT by default, not the PATCH this harness was built to
+  exercise.** `ScimStorageProviderFactory`'s config metadata defaults `user-patchOp` to
+  `false`; without explicitly setting it `true` in the SCIM federation provider's config,
+  `ScimClient.replace()` always takes the `scimRequestBuilder.update(...)` (full-replace)
+  branch, never `adapter.toPatchBuilder(...)` -- confirmed by a live run whose captured
+  update was a `PUT` with natively-typed JSON (`"active":false`, a real boolean, no
+  coercion needed). The `active.toString()` string-coercion scenario `src/patch.rs`'s
+  coercion fix exists for only happens through the PATCH path, which needs
+  `"user-patchOp": ["true"]` in the provider config to ever fire at all. With it set, a
+  live run's captured PATCH body shows `{"path":"active","value":"false"}` verbatim --
+  the JSON string, not the boolean -- which is the actual, real-traffic proof the
+  coercion fix's own doc comment predicted from reading the plugin's source alone.
 
 **Important note discovered along the way, not itself an accommodation**: the plugin's
 `UserAdapter.toSCIM()` also sets a client-side `id` value on the outbound resource
