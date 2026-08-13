@@ -16,7 +16,17 @@
 # -- using a JDK 17 Gradle image sidesteps relying on Gradle's toolchain
 # auto-provisioning to fetch a matching JDK on every build.
 FROM gradle:8-jdk17 AS plugin-builder
-WORKDIR /build
+# The build directory's own name matters here, not just cosmetically: the repo has no
+# settings.gradle (verified against the tree at the pinned commit), so Gradle falls back
+# to naming the root project after the containing directory -- and the shadow plugin's
+# default shadowJar output is `<projectName>-<version>-all.jar`. A first attempt at this
+# Dockerfile used `WORKDIR /build`, which built successfully but produced
+# `build-1.0-SNAPSHOT-all.jar`, not `keycloak-scim-1.0-SNAPSHOT-all.jar` -- caught by the
+# live GitHub Actions run of keycloak-conformance.yml (COPY failed: file not found), not
+# by anything checkable without actually running the build. Matching the upstream repo's
+# own directory name here is what makes their .gitlab-ci.yml's `gradle jar shadowjar`
+# (run from a checkout GitLab CI names after the project) reproducible in a Dockerfile.
+WORKDIR /keycloak-scim
 # Pinned to the tip of `main` at the time this harness was researched (2026-08-13) --
 # verified to build with `gradle jar shadowjar`, the exact task their own
 # .gitlab-ci.yml `package` job runs.
@@ -30,7 +40,7 @@ RUN gradle jar shadowjar --no-daemon
 # assumed); a newer Keycloak risks Provider SPI drift the plugin's own build hasn't
 # caught up to.
 FROM quay.io/keycloak/keycloak:25.0.6 AS keycloak-builder
-COPY --from=plugin-builder /build/build/libs/keycloak-scim-1.0-SNAPSHOT-all.jar \
+COPY --from=plugin-builder /keycloak-scim/build/libs/keycloak-scim-1.0-SNAPSHOT-all.jar \
     /opt/keycloak/providers/keycloak-scim-1.0-SNAPSHOT-all.jar
 RUN /opt/keycloak/bin/kc.sh build --health-enabled=true
 
