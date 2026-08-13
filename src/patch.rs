@@ -279,7 +279,7 @@ fn apply_remove(
                 // sub-attribute from every matching entry, not the whole entry.
                 let mut any_matched = false;
                 for entry in array.iter_mut() {
-                    if evaluate(value_filter, entry) {
+                    if evaluate(value_filter, entry, &path.attr_path.attr_name, schema) {
                         any_matched = true;
                         if let Value::Object(obj) = entry {
                             obj.remove(sub);
@@ -290,7 +290,7 @@ fn apply_remove(
                     return Err(PatchError::NoMatchingValue);
                 }
             } else {
-                array.retain(|entry| !evaluate(value_filter, entry));
+                array.retain(|entry| !evaluate(value_filter, entry, &path.attr_path.attr_name, schema));
                 if array.len() == before {
                     return Err(PatchError::NoMatchingValue);
                 }
@@ -397,7 +397,7 @@ fn apply_add_or_replace(
                 })?;
             let mut any_matched = false;
             for entry in array.iter_mut() {
-                if evaluate(value_filter, entry) {
+                if evaluate(value_filter, entry, &path.attr_path.attr_name, schema) {
                     any_matched = true;
                     if let Some(sub) = &path.sub_attr_after_filter {
                         if let Value::Object(obj) = entry {
@@ -422,20 +422,91 @@ fn apply_add_or_replace(
 /// collection a caller's storage owns. This is different: PATCH's bracket-filter matching
 /// operates on entries already in hand, inside one resource's own JSON, which is squarely
 /// this crate's problem since PATCH application itself is.
-fn evaluate(filter: &Filter, value: &Value) -> bool {
+///
+/// `parent_attr` is the multi-valued attribute `value` is one entry of (e.g. `"emails"`
+/// for a `type eq "work"` filter inside `emails[type eq "work"]`) -- needed alongside
+/// `schema` to resolve the filter's own attribute (e.g. `"type"`) as that parent's
+/// sub-attribute for `caseExact` lookup, since [`discovery::find_attribute`] otherwise
+/// has no way to know `"type"` isn't a top-level schema attribute.
+fn evaluate(filter: &Filter, value: &Value, parent_attr: &str, schema: Option<&SchemaResource>) -> bool {
     match filter {
         Filter::Present(path) => resolve_scalar(path, value).is_some_and(|v| !is_empty(v)),
-        Filter::Compare(path, op, comp) => {
-            resolve_scalar(path, value).is_some_and(|v| compare(v, op, comp))
+        Filter::Compare(path, op, comp) => resolve_scalar(path, value).is_some_and(|v| {
+            let case_exact = is_case_exact(
+                schema,
+                Some(parent_attr),
+                &path.attr_name,
+                path.sub_attr.as_deref(),
+            );
+            compare(v, op, comp, case_exact)
+        }),
+        Filter::And(a, b) => {
+            evaluate(a, value, parent_attr, schema) && evaluate(b, value, parent_attr, schema)
         }
-        Filter::And(a, b) => evaluate(a, value) && evaluate(b, value),
-        Filter::Or(a, b) => evaluate(a, value) || evaluate(b, value),
-        Filter::Not(inner) => !evaluate(inner, value),
+        Filter::Or(a, b) => {
+            evaluate(a, value, parent_attr, schema) || evaluate(b, value, parent_attr, schema)
+        }
+        Filter::Not(inner) => !evaluate(inner, value, parent_attr, schema),
         // A nested valuePath inside a value-filter (filtering a sub-attribute that is
         // itself multi-valued) has no realistic case in this crate's scope yet -- treat
         // as non-matching rather than guessing.
         Filter::ValuePath(_, _) => false,
     }
+}
+
+/// Resolves whether `attr_name`(.`sub_attr`) is `caseExact` per RFC 7643, consulting
+/// `schema`'s per-resource attribute table first, then [`common_attribute_case_exact`]
+/// for the RFC 7643 §3.1 common attributes every resource type shares but no schema
+/// document redeclares. `parent_attr` is `Some` when `attr_name` is itself a
+/// sub-attribute of a multi-valued attribute being bracket-filtered (see [`evaluate`]'s
+/// doc) -- in that case the lookup is against `parent_attr.attr_name`, not `attr_name`
+/// alone. Anything this can't resolve folds case, matching RFC 7643 §2.2's stated
+/// default (`caseExact` `DEFAULT: false`) -- never the reverse, since defaulting to
+/// `caseExact` would silently break case-insensitive matching for everything this can't
+/// classify, to fix the much narrower set of attributes that are actually `caseExact`.
+fn is_case_exact(
+    schema: Option<&SchemaResource>,
+    parent_attr: Option<&str>,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+) -> bool {
+    let (top, sub) = match parent_attr {
+        Some(parent) => (parent, Some(attr_name)),
+        None => (attr_name, sub_attr),
+    };
+    if let Some(schema) = schema
+        && let Some(attr_def) = discovery::find_attribute(schema, top, sub)
+    {
+        return attr_def.case_exact;
+    }
+    common_attribute_case_exact(top, sub).unwrap_or(false)
+}
+
+/// RFC 7643 §3.1 "Common Attributes" -- defined once for every resource type, not part
+/// of a specific resource's attribute table, so [`crate::user::user_schema`]/
+/// [`crate::group::group_schema`] don't redeclare them (matching how a real
+/// `/Schemas/User` document wouldn't either), meaning [`discovery::find_attribute`]
+/// alone always reports "not found" for these. Verified directly against the RFC 7643
+/// §3.1 characteristics text, not assumed: `id`, `externalId`, `meta.resourceType`, and
+/// `meta.version` are explicitly `caseExact: true`; `meta.created`, `meta.lastModified`,
+/// and `meta.location` have no `caseExact` stated, so they take §2.2's default (`false`).
+fn common_attribute_case_exact(attr_name: &str, sub_attr: Option<&str>) -> Option<bool> {
+    if attr_name.eq_ignore_ascii_case("id") && sub_attr.is_none() {
+        return Some(true);
+    }
+    if attr_name.eq_ignore_ascii_case("externalId") && sub_attr.is_none() {
+        return Some(true);
+    }
+    if attr_name.eq_ignore_ascii_case("meta")
+        && let Some(sub) = sub_attr
+    {
+        return match sub.to_ascii_lowercase().as_str() {
+            "resourcetype" | "version" => Some(true),
+            "created" | "lastmodified" | "location" => Some(false),
+            _ => None,
+        };
+    }
+    None
 }
 
 fn is_empty(v: &Value) -> bool {
@@ -454,14 +525,17 @@ fn resolve_scalar<'a>(path: &crate::filter::AttrPath, value: &'a Value) -> Optio
 
 /// RFC 7643 §2.2: `caseExact` "OPTIONAL... DEFAULT: false" -- case-*insensitive* is the
 /// spec's stated default, not an implementation nicety, so string equality/substring
-/// comparisons fold case unless the caller knows better. (A schema-aware caller wanting
-/// per-attribute `caseExact` overrides isn't implemented yet -- this default just needs
-/// to stop being wrong first; see the Follow-ups in the ticket for the schema-threaded
-/// version.)
-fn compare(actual: &Value, op: &CompareOp, expected: &CompValue) -> bool {
+/// comparisons fold case unless `case_exact` says otherwise (resolved per-attribute by
+/// [`is_case_exact`] when a schema is available; always `false` -- fold -- via
+/// [`apply_patch`], which has no schema to consult).
+fn compare(actual: &Value, op: &CompareOp, expected: &CompValue, case_exact: bool) -> bool {
     match (actual, expected) {
         (Value::String(a), CompValue::String(b)) => {
-            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            let (a, b) = if case_exact {
+                (a.clone(), b.clone())
+            } else {
+                (a.to_lowercase(), b.to_lowercase())
+            };
             match op {
                 CompareOp::Eq => a == b,
                 CompareOp::Ne => a != b,
@@ -869,6 +943,177 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["emails"][0]["value"], "new@example.com");
+    }
+
+    // --- Schema-aware caseExact filter evaluation (issue #4) ---
+
+    /// A synthetic schema with a multi-valued `widgets` attribute whose `code`
+    /// sub-attribute is `caseExact: true` and whose `label` sub-attribute is the
+    /// default `caseExact: false` -- neither `user_schema()` nor `group_schema()`
+    /// currently has a real caseExact:true sub-attribute of a multi-valued attribute,
+    /// so this is the only way to exercise bracket-filter matching against one.
+    fn widget_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Widget".to_string(),
+            name: Some("Widget".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                multi_valued: true,
+                sub_attributes: vec![
+                    crate::discovery::AttributeDefinition {
+                        case_exact: true,
+                        ..crate::discovery::AttributeDefinition::simple(
+                            "code",
+                            "string",
+                            "Case-sensitive widget code.",
+                            "readWrite",
+                        )
+                    },
+                    crate::discovery::AttributeDefinition::simple(
+                        "label",
+                        "string",
+                        "Case-insensitive widget label.",
+                        "readWrite",
+                    ),
+                ],
+                ..crate::discovery::AttributeDefinition::simple(
+                    "widgets",
+                    "complex",
+                    "A list of widgets.",
+                    "readWrite",
+                )
+            }],
+        }
+    }
+
+    fn resource_with_widgets() -> Value {
+        json!({
+            "schemas": ["urn:test:Widget"],
+            "id": "w-1",
+            "widgets": [
+                {"code": "ABC", "label": "Sprocket"}
+            ]
+        })
+    }
+
+    #[test]
+    fn schema_aware_bracket_filter_is_case_exact_for_a_caseexact_true_sub_attribute() {
+        // "code" is caseExact:true -- a filter value differing only in case must NOT
+        // match, unlike the always-fold behavior of the unscoped apply_patch.
+        let resource = resource_with_widgets();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "abc"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::NoMatchingValue);
+
+        // The exact-case value still matches.
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "ABC"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    #[test]
+    fn schema_aware_bracket_filter_still_folds_case_for_a_caseexact_false_sub_attribute() {
+        // "label" is the default caseExact:false -- case must still not matter, even
+        // with a schema present, since the RFC default is fold-not-compare.
+        let resource = resource_with_widgets();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[label eq "SPROCKET"].code"#),
+                Some(json!("XYZ")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["code"], "XYZ");
+    }
+
+    #[test]
+    fn schema_aware_bracket_filter_folds_case_for_an_unresolvable_sub_attribute() {
+        // A sub-attribute the schema doesn't model at all must still fall back to
+        // fold (the RFC default), never accidentally default to caseExact -- an
+        // unknown-attribute case must never be *more* restrictive than a known one.
+        let resource = json!({
+            "schemas": ["urn:test:Widget"],
+            "id": "w-1",
+            "widgets": [{"unmodeled": "ABC", "label": "Sprocket"}]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[unmodeled eq "abc"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    #[test]
+    fn apply_patch_without_schema_still_always_folds_case_for_bracket_filters() {
+        // Documents that the no-schema apply_patch keeps today's behavior even when
+        // the schema-aware apply_patch_with_schema would now compare "code" literally.
+        let resource = resource_with_widgets();
+        let result = apply_patch(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "abc"].label"#),
+                Some(json!("Renamed")),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    #[test]
+    fn common_attribute_case_exact_matches_rfc_7643_section_3_1_verbatim() {
+        // Verified directly against RFC 7643 3.1's characteristics text (not assumed):
+        // id/externalId/meta.resourceType/meta.version are caseExact true; meta.created,
+        // meta.lastModified, meta.location have no caseExact stated (default false).
+        assert_eq!(common_attribute_case_exact("id", None), Some(true));
+        assert_eq!(common_attribute_case_exact("externalId", None), Some(true));
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("resourceType")),
+            Some(true)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("version")),
+            Some(true)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("created")),
+            Some(false)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("lastModified")),
+            Some(false)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("location")),
+            Some(false)
+        );
+        assert_eq!(common_attribute_case_exact("userName", None), None);
     }
 
     #[test]
