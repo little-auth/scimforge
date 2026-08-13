@@ -142,7 +142,19 @@ impl KeycloakAdmin {
                 "email": format!("{username}@example.com"),
                 "firstName": "Babs",
                 "lastName": "Jensen",
-                "enabled": true
+                "enabled": true,
+                // Found only by running this live (first attempt timed out waiting for
+                // a POST that never came): ScimEventListenerProvider.onEvent(AdminEvent,
+                // ..) gates every one of CREATE/UPDATE/DELETE on
+                // `user.isEmailVerified()` (src/main/java/sh/libre/scim/event/
+                // ScimEventListenerProvider.java, pinned commit
+                // eec8ecd14971886f0d00f3dc688b587c3002f252) -- a real, currently-shipping
+                // Keycloak SCIM plugin simply does not provision a user via SCIM at all
+                // unless this Keycloak-side flag is set, independent of anything in RFC
+                // 7644. Nothing to accommodate in scimitar (this is plugin business
+                // logic, not a request shape), but the harness needs it to exercise the
+                // plugin at all.
+                "emailVerified": true
             }))
             .send()
             .await

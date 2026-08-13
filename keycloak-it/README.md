@@ -70,6 +70,32 @@ no Docker daemon available in the sandbox this harness was originally built in. 
 Keycloak run (below) is what actually confirms it, or would surface anything this
 source-reading approach missed.
 
+## Findings from actually running it (not derivable from reading source alone)
+
+The live CI run surfaced two things no amount of source-reading caught:
+
+- **The plugin gates every SCIM push on the Keycloak user's `emailVerified` flag.**
+  `ScimEventListenerProvider.onEvent(AdminEvent, boolean)` -- the handler for
+  Admin-REST-API-triggered changes, which is how this harness (and any real provisioning
+  workflow driven by an admin console or API, not user self-service) creates/updates
+  users -- wraps every one of its `CREATE`/`UPDATE`/`DELETE` branches in
+  `if (user.isEmailVerified()) { ... }`. A Keycloak user created without
+  `"emailVerified": true` in the request body is silently never pushed to the SCIM
+  service provider at all -- no error, no log visible outside Keycloak's own DEBUG
+  logging, just nothing arriving. This is plugin-specific business logic with no basis in
+  RFC 7644 (nothing to accommodate in `scimitar`), but it's essential operational
+  knowledge for exercising the plugin at all, and the kind of thing that's easy to
+  mistake for a harness bug rather than the plugin's actual, deliberate behavior. Found
+  by the harness's first live run timing out waiting for a POST that never arrived, not
+  by anything checkable from source alone.
+- **Gradle project naming is directory-sensitive.** `mitodl/keycloak-scim` has no
+  `settings.gradle`, so Gradle names the root project after the containing directory; a
+  first attempt at `Dockerfile.keycloak-scim` cloned into `WORKDIR /build`, silently
+  producing `build-1.0-SNAPSHOT-all.jar` instead of the expected
+  `keycloak-scim-1.0-SNAPSHOT-all.jar`. Fixed by naming the build directory
+  `/keycloak-scim` to match. Not a scimitar or protocol finding, but a genuine "only a
+  real build run would catch this" result.
+
 **Important note discovered along the way, not itself an accommodation**: the plugin's
 `UserAdapter.toSCIM()` also sets a client-side `id` value on the outbound resource
 representation. `scimitar::common::ResourceId`'s only *public constructor* is `new()`
