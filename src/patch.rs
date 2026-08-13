@@ -1415,6 +1415,36 @@ mod tests {
         assert_eq!(err, PatchError::ImmutableOrReadOnly("profile".to_string()));
     }
 
+    // --- Adversarial malformed-input safety (security-audit control test) ---
+
+    #[test]
+    fn immutable_add_check_never_panics_on_a_non_object_array_entry() {
+        // A malformed/adversarial resource where a "members" entry is a bare string
+        // instead of an object -- attribute_has_existing_value's entry.get(sub) and
+        // evaluate()'s resolve_scalar() must degrade to "no match"/"absent", never index
+        // or unwrap into a shape that isn't there. Asserting Result (not a panic) is the
+        // actual security property: a PATCH-processing library panicking on attacker
+        // input can take down the caller's whole request-handling thread.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": ["not-an-object", 42, null, {"value": "u-1"}]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-1"].display"#),
+                Some(json!("Bob")),
+            )],
+            &crate::group::group_schema(),
+        );
+        // Whatever the outcome, it must be a typed Result, not a panic -- reaching this
+        // assertion at all is the control test passing.
+        assert!(result.is_ok() || result.is_err());
+    }
+
     #[test]
     fn invalid_path_syntax_is_a_hard_error_not_a_best_guess() {
         let resource = user_with_emails();
