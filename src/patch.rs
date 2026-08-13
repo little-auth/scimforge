@@ -29,7 +29,7 @@
 //! `readOnly` attributes (e.g. `User.groups`) are rejected outright; `immutable`
 //! attributes (e.g. `Group.members[].display`) may be `add`ed only if they have no
 //! existing value, matching RFC 7644 §3.5.2's exact text: "a client MUST NOT modify an
-//! attribute that has mutability 'readOnly' or 'immutable'... [but] MAY 'add' a value to
+//! attribute that has mutability 'readOnly' or 'immutable'... \[but\] MAY 'add' a value to
 //! an 'immutable' attribute if the attribute had no previous value." [`apply_patch`]
 //! (no schema) still enforces the universal common-attribute protections unconditionally
 //! -- schema-driven checking is additive, not a replacement for that backstop.
@@ -166,7 +166,7 @@ fn apply_one(
 }
 
 /// RFC 7644 §3.5.2: "a client MUST NOT modify an attribute that has mutability
-/// 'readOnly' or 'immutable'... [but] MAY 'add' a value to an 'immutable' attribute if
+/// 'readOnly' or 'immutable'... \[but\] MAY 'add' a value to an 'immutable' attribute if
 /// the attribute had no previous value" -- quoted verbatim since the "add exception"
 /// is easy to get subtly wrong (it's `add` specifically, not `add` or `replace`, and only
 /// when no previous value exists). `replace`/`remove` on an immutable attribute are
@@ -466,10 +466,11 @@ fn apply_add_or_replace(
 /// this crate's problem since PATCH application itself is.
 ///
 /// `parent_attr` is the multi-valued attribute `value` is one entry of (e.g. `"emails"`
-/// for a `type eq "work"` filter inside `emails[type eq "work"]`) -- needed alongside
-/// `schema` to resolve the filter's own attribute (e.g. `"type"`) as that parent's
-/// sub-attribute for `caseExact` lookup, since [`discovery::find_attribute`] otherwise
-/// has no way to know `"type"` isn't a top-level schema attribute.
+/// for a `type eq "work"` filter inside `emails[type eq "work"]`) -- passed to
+/// [`discovery::is_case_exact`] alongside `schema` so it can resolve the filter's own
+/// attribute (e.g. `"type"`) as that parent's sub-attribute for `caseExact` lookup,
+/// since [`discovery::find_attribute`] alone has no way to know `"type"` isn't a
+/// top-level schema attribute.
 fn evaluate(
     filter: &Filter,
     value: &Value,
@@ -479,7 +480,7 @@ fn evaluate(
     match filter {
         Filter::Present(path) => resolve_scalar(path, value).is_some_and(|v| !is_empty(v)),
         Filter::Compare(path, op, comp) => resolve_scalar(path, value).is_some_and(|v| {
-            let case_exact = is_case_exact(
+            let case_exact = discovery::is_case_exact(
                 schema,
                 Some(parent_attr),
                 &path.attr_name,
@@ -501,72 +502,6 @@ fn evaluate(
     }
 }
 
-/// Resolves whether `attr_name`(.`sub_attr`) is `caseExact` per RFC 7643, consulting
-/// `schema`'s per-resource attribute table first, then [`common_attribute_case_exact`]
-/// for the RFC 7643 §3.1 common attributes every resource type shares but no schema
-/// document redeclares. `parent_attr` is `Some` when `attr_name` is itself a
-/// sub-attribute of a multi-valued attribute being bracket-filtered (see [`evaluate`]'s
-/// doc) -- in that case the lookup is against `parent_attr.attr_name`, not `attr_name`
-/// alone. Anything this can't resolve folds case, matching RFC 7643 §2.2's stated
-/// default (`caseExact` `DEFAULT: false`) -- never the reverse, since defaulting to
-/// `caseExact` would silently break case-insensitive matching for everything this can't
-/// classify, to fix the much narrower set of attributes that are actually `caseExact`.
-///
-/// [`evaluate`], this function's only current caller, always passes `parent_attr:
-/// Some(..)` (every value it evaluates is one entry of a bracket-filtered multi-valued
-/// attribute), so the `parent_attr: None` branch -- and by extension
-/// [`common_attribute_case_exact`]'s `id`/`externalId` entries, which require
-/// `sub_attr.is_none()` -- isn't reachable through PATCH bracket-filter matching today:
-/// `id`/`externalId`/`meta.*` are resource-level common attributes and can never
-/// themselves be a multi-valued attribute's sub-attribute. Both branches are covered
-/// directly by this function's own unit tests rather than through `evaluate()`, kept
-/// correct and ready for a future caller (e.g. a top-level attribute resolution) rather
-/// than removed as dead code.
-fn is_case_exact(
-    schema: Option<&SchemaResource>,
-    parent_attr: Option<&str>,
-    attr_name: &str,
-    sub_attr: Option<&str>,
-) -> bool {
-    let (top, sub) = match parent_attr {
-        Some(parent) => (parent, Some(attr_name)),
-        None => (attr_name, sub_attr),
-    };
-    if let Some(schema) = schema
-        && let Some(attr_def) = discovery::find_attribute(schema, top, sub)
-    {
-        return attr_def.case_exact;
-    }
-    common_attribute_case_exact(top, sub).unwrap_or(false)
-}
-
-/// RFC 7643 §3.1 "Common Attributes" -- defined once for every resource type, not part
-/// of a specific resource's attribute table, so [`crate::user::user_schema`]/
-/// [`crate::group::group_schema`] don't redeclare them (matching how a real
-/// `/Schemas/User` document wouldn't either), meaning [`discovery::find_attribute`]
-/// alone always reports "not found" for these. Verified directly against the RFC 7643
-/// §3.1 characteristics text, not assumed: `id`, `externalId`, `meta.resourceType`, and
-/// `meta.version` are explicitly `caseExact: true`; `meta.created`, `meta.lastModified`,
-/// and `meta.location` have no `caseExact` stated, so they take §2.2's default (`false`).
-fn common_attribute_case_exact(attr_name: &str, sub_attr: Option<&str>) -> Option<bool> {
-    if attr_name.eq_ignore_ascii_case("id") && sub_attr.is_none() {
-        return Some(true);
-    }
-    if attr_name.eq_ignore_ascii_case("externalId") && sub_attr.is_none() {
-        return Some(true);
-    }
-    if attr_name.eq_ignore_ascii_case("meta")
-        && let Some(sub) = sub_attr
-    {
-        return match sub.to_ascii_lowercase().as_str() {
-            "resourcetype" | "version" => Some(true),
-            "created" | "lastmodified" | "location" => Some(false),
-            _ => None,
-        };
-    }
-    None
-}
-
 fn is_empty(v: &Value) -> bool {
     matches!(v, Value::Null)
         || matches!(v, Value::String(s) if s.is_empty())
@@ -584,8 +519,8 @@ fn resolve_scalar<'a>(path: &crate::filter::AttrPath, value: &'a Value) -> Optio
 /// RFC 7643 §2.2: `caseExact` "OPTIONAL... DEFAULT: false" -- case-*insensitive* is the
 /// spec's stated default, not an implementation nicety, so string equality/substring
 /// comparisons fold case unless `case_exact` says otherwise (resolved per-attribute by
-/// [`is_case_exact`] when a schema is available; always `false` -- fold -- via
-/// [`apply_patch`], which has no schema to consult).
+/// [`discovery::is_case_exact`] when a schema is available; always `false` -- fold --
+/// via [`apply_patch`], which has no schema to consult).
 fn compare(actual: &Value, op: &CompareOp, expected: &CompValue, case_exact: bool) -> bool {
     match (actual, expected) {
         (Value::String(a), CompValue::String(b)) => {
@@ -1142,73 +1077,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["widgets"][0]["label"], "Renamed");
-    }
-
-    #[test]
-    fn common_attribute_case_exact_matches_rfc_7643_section_3_1_verbatim() {
-        // Verified directly against RFC 7643 3.1's characteristics text (not assumed):
-        // id/externalId/meta.resourceType/meta.version are caseExact true; meta.created,
-        // meta.lastModified, meta.location have no caseExact stated (default false).
-        assert_eq!(common_attribute_case_exact("id", None), Some(true));
-        assert_eq!(common_attribute_case_exact("externalId", None), Some(true));
-        assert_eq!(
-            common_attribute_case_exact("meta", Some("resourceType")),
-            Some(true)
-        );
-        assert_eq!(
-            common_attribute_case_exact("meta", Some("version")),
-            Some(true)
-        );
-        assert_eq!(
-            common_attribute_case_exact("meta", Some("created")),
-            Some(false)
-        );
-        assert_eq!(
-            common_attribute_case_exact("meta", Some("lastModified")),
-            Some(false)
-        );
-        assert_eq!(
-            common_attribute_case_exact("meta", Some("location")),
-            Some(false)
-        );
-        assert_eq!(common_attribute_case_exact("userName", None), None);
-    }
-
-    #[test]
-    fn is_case_exact_resolves_a_top_level_common_attribute_with_no_parent_attr() {
-        // Direct coverage of is_case_exact's `parent_attr: None` branch -- not reachable
-        // through evaluate() today (see is_case_exact's doc comment), but its own
-        // resolution logic (schema lookup first, common-attributes table fallback) must
-        // still be correct for whenever a future caller does invoke it this way.
-        assert!(is_case_exact(None, None, "id", None));
-        assert!(is_case_exact(None, None, "externalId", None));
-        assert!(is_case_exact(None, None, "meta", Some("resourceType")));
-        assert!(!is_case_exact(None, None, "meta", Some("created")));
-        // Unresolvable (no schema, not a common attribute) folds.
-        assert!(!is_case_exact(None, None, "userName", None));
-    }
-
-    #[test]
-    fn is_case_exact_prefers_the_schema_over_the_common_attributes_table() {
-        // A schema that resolves the attribute wins over common_attribute_case_exact's
-        // fallback, even for a name that collides with a common attribute -- schema is
-        // always the more specific, authoritative source when it has an opinion.
-        let schema = SchemaResource {
-            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
-            id: "urn:test:Override".to_string(),
-            name: None,
-            description: None,
-            attributes: vec![crate::discovery::AttributeDefinition {
-                case_exact: false,
-                ..crate::discovery::AttributeDefinition::simple(
-                    "externalId",
-                    "string",
-                    "A schema that (unusually) redeclares externalId.",
-                    "readWrite",
-                )
-            }],
-        };
-        assert!(!is_case_exact(Some(&schema), None, "externalId", None));
     }
 
     #[test]
