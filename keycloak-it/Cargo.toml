@@ -1,0 +1,33 @@
+[package]
+name = "keycloak-it"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Disposable example SCIM 2.0 consumer + Keycloak real-IdP conformance test harness for scimitar (GitHub issue #1) -- not a reference implementation, not published, not covered by scimitar's own conformance rigor."
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[[bin]]
+name = "scim-it-server"
+path = "src/main.rs"
+
+[dependencies]
+scimitar = { path = ".." }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }

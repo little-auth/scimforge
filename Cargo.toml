@@ -1,3 +1,10 @@
+[workspace]
+members = ["keycloak-it"]
+# scimitar itself is a workspace root package, not a virtual-manifest workspace, so
+# `cargo build`/`cargo test` at the repo root still targets scimitar by default -- see
+# `cargo package --list -p scimitar` parity check in the keycloak-it implementation notes
+# for why this doesn't change what `scimitar` publishes to crates.io.
+
 [package]
 name = "scimitar"
 version = "0.1.0"
