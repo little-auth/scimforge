@@ -17,9 +17,10 @@ delete throws (KC-SERVICES0085, NullPointerException at ScimEventListenerProvide
 and no DELETE ever reaches the SCIM service provider. With this patch applied, the DELETE
 event correctly dispatches through to the configured SCIM endpoint.
 
-Filed upstream: https://github.com/mitodl/keycloak-scim/issues/<TBD> -- remove this patch
-and the `git apply` step in Dockerfile.keycloak-scim once that (or an equivalent fix)
-lands and this harness's pinned KEYCLOAK_SCIM_COMMIT moves past it.
+Filed upstream: https://github.com/mitodl/keycloak-scim/issues/181, fix proposed at
+https://github.com/mitodl/keycloak-scim/pull/182 -- remove this patch and the
+`git apply` step in Dockerfile.keycloak-scim once that (or an equivalent fix) lands
+and this harness's pinned KEYCLOAK_SCIM_COMMIT moves past it.
 
 --- a/src/main/java/sh/libre/scim/event/ScimEventListenerProvider.java
 +++ b/src/main/java/sh/libre/scim/event/ScimEventListenerProvider.java
