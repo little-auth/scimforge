@@ -511,6 +511,17 @@ fn evaluate(
 /// default (`caseExact` `DEFAULT: false`) -- never the reverse, since defaulting to
 /// `caseExact` would silently break case-insensitive matching for everything this can't
 /// classify, to fix the much narrower set of attributes that are actually `caseExact`.
+///
+/// [`evaluate`], this function's only current caller, always passes `parent_attr:
+/// Some(..)` (every value it evaluates is one entry of a bracket-filtered multi-valued
+/// attribute), so the `parent_attr: None` branch -- and by extension
+/// [`common_attribute_case_exact`]'s `id`/`externalId` entries, which require
+/// `sub_attr.is_none()` -- isn't reachable through PATCH bracket-filter matching today:
+/// `id`/`externalId`/`meta.*` are resource-level common attributes and can never
+/// themselves be a multi-valued attribute's sub-attribute. Both branches are covered
+/// directly by this function's own unit tests rather than through `evaluate()`, kept
+/// correct and ready for a future caller (e.g. a top-level attribute resolution) rather
+/// than removed as dead code.
 fn is_case_exact(
     schema: Option<&SchemaResource>,
     parent_attr: Option<&str>,
@@ -1161,6 +1172,43 @@ mod tests {
             Some(false)
         );
         assert_eq!(common_attribute_case_exact("userName", None), None);
+    }
+
+    #[test]
+    fn is_case_exact_resolves_a_top_level_common_attribute_with_no_parent_attr() {
+        // Direct coverage of is_case_exact's `parent_attr: None` branch -- not reachable
+        // through evaluate() today (see is_case_exact's doc comment), but its own
+        // resolution logic (schema lookup first, common-attributes table fallback) must
+        // still be correct for whenever a future caller does invoke it this way.
+        assert!(is_case_exact(None, None, "id", None));
+        assert!(is_case_exact(None, None, "externalId", None));
+        assert!(is_case_exact(None, None, "meta", Some("resourceType")));
+        assert!(!is_case_exact(None, None, "meta", Some("created")));
+        // Unresolvable (no schema, not a common attribute) folds.
+        assert!(!is_case_exact(None, None, "userName", None));
+    }
+
+    #[test]
+    fn is_case_exact_prefers_the_schema_over_the_common_attributes_table() {
+        // A schema that resolves the attribute wins over common_attribute_case_exact's
+        // fallback, even for a name that collides with a common attribute -- schema is
+        // always the more specific, authoritative source when it has an opinion.
+        let schema = SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Override".to_string(),
+            name: None,
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                case_exact: false,
+                ..crate::discovery::AttributeDefinition::simple(
+                    "externalId",
+                    "string",
+                    "A schema that (unusually) redeclares externalId.",
+                    "readWrite",
+                )
+            }],
+        };
+        assert!(!is_case_exact(Some(&schema), None, "externalId", None));
     }
 
     #[test]

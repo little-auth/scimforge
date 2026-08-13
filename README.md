@@ -49,11 +49,16 @@ One more spec detail worth calling out because it's easy to get backwards: RFC 7
 the spec's stated default, not case-sensitive. Filter matching (`eq`, `co`, `sw`, `ew`)
 folds case unless told otherwise -- I found and fixed a real bug in an early build where
 this was backwards. Schema-driven PATCH (`apply_patch_with_schema`) goes a step further:
-it consults each attribute's actual `caseExact` from the schema (`id`, `externalId`,
-`meta.resourceType`, and `meta.version` are `caseExact: true` per RFC 7643 §3.1/§4.1, most
-other attributes aren't), so bracket-filter matching on those compares literally instead
-of folding. `apply_patch` (no schema) still always folds, since it has no schema to
-consult.
+PATCH's bracket-filter matching (e.g. `emails[type eq "work"]`) now consults the matched
+sub-attribute's actual `caseExact` from the schema instead of always folding -- if a
+resource type ever defines a `caseExact: true` sub-attribute of a multi-valued attribute,
+filtering on it compares literally. `id`, `externalId`, `meta.resourceType`, and
+`meta.version` are real RFC 7643 §3.1 `caseExact: true` examples (and `profileUrl` per
+§4.1), which is why this exists at all -- though none of them can themselves appear
+inside a bracket filter (they're resource-level attributes, never sub-attributes of a
+multi-valued one), so this crate carries a small lookup table for them ready for the day
+something needs it, not because PATCH filtering exercises it today. `apply_patch` (no
+schema) still always folds, since it has no schema to consult.
 
 ## What's here
 
@@ -62,7 +67,7 @@ grammar (§3.4.2.2), full PATCH semantics including schema-driven mutability enf
 (§3.5.2), bulk operations with `bulkId` cross-referencing and dependency ordering
 (§3.7), discovery resources (ServiceProviderConfig/ResourceType/Schema, §5-7),
 ListResponse and pagination (§3.4.2), and the Error response shape with all ten
-canonical `scimType` keywords (§3.12, Table 9). 110 tests.
+canonical `scimType` keywords (§3.12, Table 9). 114 tests.
 
 ## Status
 
