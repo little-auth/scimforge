@@ -169,21 +169,15 @@ fn apply_one(
 /// 'readOnly' or 'immutable'... [but] MAY 'add' a value to an 'immutable' attribute if
 /// the attribute had no previous value" -- quoted verbatim since the "add exception"
 /// is easy to get subtly wrong (it's `add` specifically, not `add` or `replace`, and only
-/// when no previous value exists).
-///
-/// Precision note for the sub-attribute case (e.g. `members[value eq "x"].display`):
-/// "had no previous value" is checked against whether the *top-level* attribute
-/// (`members`) has any entries at all, not whether the one specific array entry the
-/// bracket filter matches already has that sub-attribute set. This makes the check
-/// conservative (may reject an add RFC 7644 would technically permit) rather than
-/// permissive (never allows one it shouldn't) -- `replace`/`remove` on an immutable
-/// sub-attribute are rejected unconditionally either way, which is the higher-value,
-/// unambiguous case this exists to catch.
+/// when no previous value exists). `replace`/`remove` on an immutable attribute are
+/// rejected unconditionally regardless of `value_filter`, so `has_existing` below is only
+/// ever actually evaluated for `op == PatchOp::Add`.
 fn check_mutability(
     schema: &SchemaResource,
     resource: &Value,
     attr_name: &str,
     sub_attr: Option<&str>,
+    value_filter: Option<&Filter>,
     op: PatchOp,
 ) -> Result<(), PatchError> {
     let Some(attr_def) = discovery::find_attribute(schema, attr_name, sub_attr) else {
@@ -197,9 +191,13 @@ fn check_mutability(
         Mutability::ReadOnly => Err(PatchError::ImmutableOrReadOnly(attr_name.to_string())),
         Mutability::Immutable => {
             let has_existing = op != PatchOp::Add
-                || resource
-                    .get(attr_name)
-                    .is_some_and(|v| !matches!(v, Value::Null));
+                || attribute_has_existing_value(
+                    resource,
+                    attr_name,
+                    sub_attr,
+                    value_filter,
+                    schema,
+                );
             if has_existing {
                 Err(PatchError::ImmutableOrReadOnly(attr_name.to_string()))
             } else {
@@ -207,6 +205,46 @@ fn check_mutability(
             }
         }
         Mutability::ReadWrite | Mutability::WriteOnly => Ok(()),
+    }
+}
+
+/// Whether `attr_name`(.`sub_attr`) already has a value on `resource`, precisely --
+/// consulting the specific bracket-filter-matched array entry when `value_filter` is
+/// `Some` (e.g. `members[value eq "x"].display`), and the specific sub-attribute of a
+/// plain dotted path otherwise (e.g. `profile.level`), rather than only whether the
+/// top-level attribute is present at all. That coarser check is [`check_mutability`]'s
+/// only source of imprecision in the immutable "had no previous value" add-exception --
+/// `replace`/`remove` reject unconditionally regardless, so this is never consulted for
+/// them.
+fn attribute_has_existing_value(
+    resource: &Value,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+    value_filter: Option<&Filter>,
+    schema: &SchemaResource,
+) -> bool {
+    match (
+        value_filter,
+        resource.get(attr_name).and_then(Value::as_array),
+    ) {
+        (Some(filter), Some(array)) => array
+            .iter()
+            .filter(|entry| evaluate(filter, entry, attr_name, Some(schema)))
+            .any(|entry| match sub_attr {
+                Some(sub) => entry.get(sub).is_some_and(|v| !matches!(v, Value::Null)),
+                // A matched entry existing at all is itself "a previous value" when the
+                // path targets no sub-attribute (e.g. a whole-entry replace target).
+                None => true,
+            }),
+        _ => match sub_attr {
+            Some(sub) => resource
+                .get(attr_name)
+                .and_then(|v| v.get(sub))
+                .is_some_and(|v| !matches!(v, Value::Null)),
+            None => resource
+                .get(attr_name)
+                .is_some_and(|v| !matches!(v, Value::Null)),
+        },
     }
 }
 
@@ -241,6 +279,7 @@ fn apply_remove(
             resource,
             &path.attr_path.attr_name,
             effective_sub_attr(&path),
+            path.value_filter.as_ref(),
             PatchOp::Remove,
         )?;
     }
@@ -279,7 +318,7 @@ fn apply_remove(
                 // sub-attribute from every matching entry, not the whole entry.
                 let mut any_matched = false;
                 for entry in array.iter_mut() {
-                    if evaluate(value_filter, entry) {
+                    if evaluate(value_filter, entry, &path.attr_path.attr_name, schema) {
                         any_matched = true;
                         if let Value::Object(obj) = entry {
                             obj.remove(sub);
@@ -290,7 +329,9 @@ fn apply_remove(
                     return Err(PatchError::NoMatchingValue);
                 }
             } else {
-                array.retain(|entry| !evaluate(value_filter, entry));
+                array.retain(|entry| {
+                    !evaluate(value_filter, entry, &path.attr_path.attr_name, schema)
+                });
                 if array.len() == before {
                     return Err(PatchError::NoMatchingValue);
                 }
@@ -326,7 +367,7 @@ fn apply_add_or_replace(
                 return Err(PatchError::Protected(key.clone()));
             }
             if let Some(schema) = schema {
-                check_mutability(schema, resource, key, None, op_kind)?;
+                check_mutability(schema, resource, key, None, None, op_kind)?;
             }
         }
         let root = resource.as_object_mut().ok_or_else(|| {
@@ -348,6 +389,7 @@ fn apply_add_or_replace(
             resource,
             &path.attr_path.attr_name,
             effective_sub_attr(&path),
+            path.value_filter.as_ref(),
             op_kind,
         )?;
     }
@@ -397,7 +439,7 @@ fn apply_add_or_replace(
                 })?;
             let mut any_matched = false;
             for entry in array.iter_mut() {
-                if evaluate(value_filter, entry) {
+                if evaluate(value_filter, entry, &path.attr_path.attr_name, schema) {
                     any_matched = true;
                     if let Some(sub) = &path.sub_attr_after_filter {
                         if let Value::Object(obj) = entry {
@@ -422,20 +464,107 @@ fn apply_add_or_replace(
 /// collection a caller's storage owns. This is different: PATCH's bracket-filter matching
 /// operates on entries already in hand, inside one resource's own JSON, which is squarely
 /// this crate's problem since PATCH application itself is.
-fn evaluate(filter: &Filter, value: &Value) -> bool {
+///
+/// `parent_attr` is the multi-valued attribute `value` is one entry of (e.g. `"emails"`
+/// for a `type eq "work"` filter inside `emails[type eq "work"]`) -- needed alongside
+/// `schema` to resolve the filter's own attribute (e.g. `"type"`) as that parent's
+/// sub-attribute for `caseExact` lookup, since [`discovery::find_attribute`] otherwise
+/// has no way to know `"type"` isn't a top-level schema attribute.
+fn evaluate(
+    filter: &Filter,
+    value: &Value,
+    parent_attr: &str,
+    schema: Option<&SchemaResource>,
+) -> bool {
     match filter {
         Filter::Present(path) => resolve_scalar(path, value).is_some_and(|v| !is_empty(v)),
-        Filter::Compare(path, op, comp) => {
-            resolve_scalar(path, value).is_some_and(|v| compare(v, op, comp))
+        Filter::Compare(path, op, comp) => resolve_scalar(path, value).is_some_and(|v| {
+            let case_exact = is_case_exact(
+                schema,
+                Some(parent_attr),
+                &path.attr_name,
+                path.sub_attr.as_deref(),
+            );
+            compare(v, op, comp, case_exact)
+        }),
+        Filter::And(a, b) => {
+            evaluate(a, value, parent_attr, schema) && evaluate(b, value, parent_attr, schema)
         }
-        Filter::And(a, b) => evaluate(a, value) && evaluate(b, value),
-        Filter::Or(a, b) => evaluate(a, value) || evaluate(b, value),
-        Filter::Not(inner) => !evaluate(inner, value),
+        Filter::Or(a, b) => {
+            evaluate(a, value, parent_attr, schema) || evaluate(b, value, parent_attr, schema)
+        }
+        Filter::Not(inner) => !evaluate(inner, value, parent_attr, schema),
         // A nested valuePath inside a value-filter (filtering a sub-attribute that is
         // itself multi-valued) has no realistic case in this crate's scope yet -- treat
         // as non-matching rather than guessing.
         Filter::ValuePath(_, _) => false,
     }
+}
+
+/// Resolves whether `attr_name`(.`sub_attr`) is `caseExact` per RFC 7643, consulting
+/// `schema`'s per-resource attribute table first, then [`common_attribute_case_exact`]
+/// for the RFC 7643 §3.1 common attributes every resource type shares but no schema
+/// document redeclares. `parent_attr` is `Some` when `attr_name` is itself a
+/// sub-attribute of a multi-valued attribute being bracket-filtered (see [`evaluate`]'s
+/// doc) -- in that case the lookup is against `parent_attr.attr_name`, not `attr_name`
+/// alone. Anything this can't resolve folds case, matching RFC 7643 §2.2's stated
+/// default (`caseExact` `DEFAULT: false`) -- never the reverse, since defaulting to
+/// `caseExact` would silently break case-insensitive matching for everything this can't
+/// classify, to fix the much narrower set of attributes that are actually `caseExact`.
+///
+/// [`evaluate`], this function's only current caller, always passes `parent_attr:
+/// Some(..)` (every value it evaluates is one entry of a bracket-filtered multi-valued
+/// attribute), so the `parent_attr: None` branch -- and by extension
+/// [`common_attribute_case_exact`]'s `id`/`externalId` entries, which require
+/// `sub_attr.is_none()` -- isn't reachable through PATCH bracket-filter matching today:
+/// `id`/`externalId`/`meta.*` are resource-level common attributes and can never
+/// themselves be a multi-valued attribute's sub-attribute. Both branches are covered
+/// directly by this function's own unit tests rather than through `evaluate()`, kept
+/// correct and ready for a future caller (e.g. a top-level attribute resolution) rather
+/// than removed as dead code.
+fn is_case_exact(
+    schema: Option<&SchemaResource>,
+    parent_attr: Option<&str>,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+) -> bool {
+    let (top, sub) = match parent_attr {
+        Some(parent) => (parent, Some(attr_name)),
+        None => (attr_name, sub_attr),
+    };
+    if let Some(schema) = schema
+        && let Some(attr_def) = discovery::find_attribute(schema, top, sub)
+    {
+        return attr_def.case_exact;
+    }
+    common_attribute_case_exact(top, sub).unwrap_or(false)
+}
+
+/// RFC 7643 §3.1 "Common Attributes" -- defined once for every resource type, not part
+/// of a specific resource's attribute table, so [`crate::user::user_schema`]/
+/// [`crate::group::group_schema`] don't redeclare them (matching how a real
+/// `/Schemas/User` document wouldn't either), meaning [`discovery::find_attribute`]
+/// alone always reports "not found" for these. Verified directly against the RFC 7643
+/// §3.1 characteristics text, not assumed: `id`, `externalId`, `meta.resourceType`, and
+/// `meta.version` are explicitly `caseExact: true`; `meta.created`, `meta.lastModified`,
+/// and `meta.location` have no `caseExact` stated, so they take §2.2's default (`false`).
+fn common_attribute_case_exact(attr_name: &str, sub_attr: Option<&str>) -> Option<bool> {
+    if attr_name.eq_ignore_ascii_case("id") && sub_attr.is_none() {
+        return Some(true);
+    }
+    if attr_name.eq_ignore_ascii_case("externalId") && sub_attr.is_none() {
+        return Some(true);
+    }
+    if attr_name.eq_ignore_ascii_case("meta")
+        && let Some(sub) = sub_attr
+    {
+        return match sub.to_ascii_lowercase().as_str() {
+            "resourcetype" | "version" => Some(true),
+            "created" | "lastmodified" | "location" => Some(false),
+            _ => None,
+        };
+    }
+    None
 }
 
 fn is_empty(v: &Value) -> bool {
@@ -454,14 +583,17 @@ fn resolve_scalar<'a>(path: &crate::filter::AttrPath, value: &'a Value) -> Optio
 
 /// RFC 7643 §2.2: `caseExact` "OPTIONAL... DEFAULT: false" -- case-*insensitive* is the
 /// spec's stated default, not an implementation nicety, so string equality/substring
-/// comparisons fold case unless the caller knows better. (A schema-aware caller wanting
-/// per-attribute `caseExact` overrides isn't implemented yet -- this default just needs
-/// to stop being wrong first; see the Follow-ups in the ticket for the schema-threaded
-/// version.)
-fn compare(actual: &Value, op: &CompareOp, expected: &CompValue) -> bool {
+/// comparisons fold case unless `case_exact` says otherwise (resolved per-attribute by
+/// [`is_case_exact`] when a schema is available; always `false` -- fold -- via
+/// [`apply_patch`], which has no schema to consult).
+fn compare(actual: &Value, op: &CompareOp, expected: &CompValue, case_exact: bool) -> bool {
     match (actual, expected) {
         (Value::String(a), CompValue::String(b)) => {
-            let (a, b) = (a.to_lowercase(), b.to_lowercase());
+            let (a, b) = if case_exact {
+                (a.clone(), b.clone())
+            } else {
+                (a.to_lowercase(), b.to_lowercase())
+            };
             match op {
                 CompareOp::Eq => a == b,
                 CompareOp::Ne => a != b,
@@ -869,6 +1001,448 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["emails"][0]["value"], "new@example.com");
+    }
+
+    // --- Schema-aware caseExact filter evaluation (issue #4) ---
+
+    /// A synthetic schema with a multi-valued `widgets` attribute whose `code`
+    /// sub-attribute is `caseExact: true` and whose `label` sub-attribute is the
+    /// default `caseExact: false` -- neither `user_schema()` nor `group_schema()`
+    /// currently has a real caseExact:true sub-attribute of a multi-valued attribute,
+    /// so this is the only way to exercise bracket-filter matching against one.
+    fn widget_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Widget".to_string(),
+            name: Some("Widget".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                multi_valued: true,
+                sub_attributes: vec![
+                    crate::discovery::AttributeDefinition {
+                        case_exact: true,
+                        ..crate::discovery::AttributeDefinition::simple(
+                            "code",
+                            "string",
+                            "Case-sensitive widget code.",
+                            "readWrite",
+                        )
+                    },
+                    crate::discovery::AttributeDefinition::simple(
+                        "label",
+                        "string",
+                        "Case-insensitive widget label.",
+                        "readWrite",
+                    ),
+                ],
+                ..crate::discovery::AttributeDefinition::simple(
+                    "widgets",
+                    "complex",
+                    "A list of widgets.",
+                    "readWrite",
+                )
+            }],
+        }
+    }
+
+    fn resource_with_widgets() -> Value {
+        json!({
+            "schemas": ["urn:test:Widget"],
+            "id": "w-1",
+            "widgets": [
+                {"code": "ABC", "label": "Sprocket"}
+            ]
+        })
+    }
+
+    #[test]
+    fn schema_aware_bracket_filter_is_case_exact_for_a_caseexact_true_sub_attribute() {
+        // "code" is caseExact:true -- a filter value differing only in case must NOT
+        // match, unlike the always-fold behavior of the unscoped apply_patch.
+        let resource = resource_with_widgets();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "abc"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::NoMatchingValue);
+
+        // The exact-case value still matches.
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "ABC"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    #[test]
+    fn schema_aware_bracket_filter_still_folds_case_for_a_caseexact_false_sub_attribute() {
+        // "label" is the default caseExact:false -- case must still not matter, even
+        // with a schema present, since the RFC default is fold-not-compare.
+        let resource = resource_with_widgets();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[label eq "SPROCKET"].code"#),
+                Some(json!("XYZ")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["code"], "XYZ");
+    }
+
+    #[test]
+    fn schema_aware_bracket_filter_folds_case_for_an_unresolvable_sub_attribute() {
+        // A sub-attribute the schema doesn't model at all must still fall back to
+        // fold (the RFC default), never accidentally default to caseExact -- an
+        // unknown-attribute case must never be *more* restrictive than a known one.
+        let resource = json!({
+            "schemas": ["urn:test:Widget"],
+            "id": "w-1",
+            "widgets": [{"unmodeled": "ABC", "label": "Sprocket"}]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[unmodeled eq "abc"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    #[test]
+    fn apply_patch_without_schema_still_always_folds_case_for_bracket_filters() {
+        // Documents that the no-schema apply_patch keeps today's behavior even when
+        // the schema-aware apply_patch_with_schema would now compare "code" literally.
+        let resource = resource_with_widgets();
+        let result = apply_patch(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "abc"].label"#),
+                Some(json!("Renamed")),
+            )],
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    #[test]
+    fn common_attribute_case_exact_matches_rfc_7643_section_3_1_verbatim() {
+        // Verified directly against RFC 7643 3.1's characteristics text (not assumed):
+        // id/externalId/meta.resourceType/meta.version are caseExact true; meta.created,
+        // meta.lastModified, meta.location have no caseExact stated (default false).
+        assert_eq!(common_attribute_case_exact("id", None), Some(true));
+        assert_eq!(common_attribute_case_exact("externalId", None), Some(true));
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("resourceType")),
+            Some(true)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("version")),
+            Some(true)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("created")),
+            Some(false)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("lastModified")),
+            Some(false)
+        );
+        assert_eq!(
+            common_attribute_case_exact("meta", Some("location")),
+            Some(false)
+        );
+        assert_eq!(common_attribute_case_exact("userName", None), None);
+    }
+
+    #[test]
+    fn is_case_exact_resolves_a_top_level_common_attribute_with_no_parent_attr() {
+        // Direct coverage of is_case_exact's `parent_attr: None` branch -- not reachable
+        // through evaluate() today (see is_case_exact's doc comment), but its own
+        // resolution logic (schema lookup first, common-attributes table fallback) must
+        // still be correct for whenever a future caller does invoke it this way.
+        assert!(is_case_exact(None, None, "id", None));
+        assert!(is_case_exact(None, None, "externalId", None));
+        assert!(is_case_exact(None, None, "meta", Some("resourceType")));
+        assert!(!is_case_exact(None, None, "meta", Some("created")));
+        // Unresolvable (no schema, not a common attribute) folds.
+        assert!(!is_case_exact(None, None, "userName", None));
+    }
+
+    #[test]
+    fn is_case_exact_prefers_the_schema_over_the_common_attributes_table() {
+        // A schema that resolves the attribute wins over common_attribute_case_exact's
+        // fallback, even for a name that collides with a common attribute -- schema is
+        // always the more specific, authoritative source when it has an opinion.
+        let schema = SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Override".to_string(),
+            name: None,
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                case_exact: false,
+                ..crate::discovery::AttributeDefinition::simple(
+                    "externalId",
+                    "string",
+                    "A schema that (unusually) redeclares externalId.",
+                    "readWrite",
+                )
+            }],
+        };
+        assert!(!is_case_exact(Some(&schema), None, "externalId", None));
+    }
+
+    #[test]
+    fn schema_aware_compound_filter_resolves_case_exact_independently_per_clause() {
+        // Adversarial: an AND-combined filter mixes a caseExact:true clause ("code") with
+        // a caseExact:false clause ("label") against the same entry -- Filter::And's
+        // recursion must thread parent_attr/schema into *both* sides independently, not
+        // drop it after the first recursive call.
+        let resource = resource_with_widgets();
+
+        // Wrong-case "code" (case-exact) must fail to match even though "label" matches
+        // case-insensitively -- proves the AND's left branch is truly case-exact.
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "abc" and label eq "SPROCKET"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::NoMatchingValue);
+
+        // Exact-case "code" plus wrong-case "label" (case-insensitive) must still match --
+        // proves the AND's right branch still folds.
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "ABC" and label eq "SPROCKET"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
+    // --- Precise bracket-filtered immutable add-when-absent (issue #2) ---
+
+    fn group_with_two_members() -> Value {
+        json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [
+                {"value": "u-1", "type": "User", "display": "Alice"},
+                {"value": "u-2", "type": "User"}
+            ]
+        })
+    }
+
+    #[test]
+    fn schema_allows_add_on_an_immutable_sub_attribute_when_the_matched_entry_has_no_prior_value() {
+        // u-2 has no `display` set yet -- RFC 7644 3.5.2's add-exception should allow it,
+        // even though the top-level `members` array has other entries (u-1) that do have
+        // `display` set. The old conservative check rejected this.
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-2"].display"#),
+                Some(json!("Bob")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        let members = result["members"].as_array().unwrap();
+        assert_eq!(members[1]["display"], "Bob");
+        // u-1's existing display is untouched.
+        assert_eq!(members[0]["display"], "Alice");
+    }
+
+    #[test]
+    fn schema_rejects_add_on_an_immutable_sub_attribute_when_the_matched_entry_already_has_a_value()
+    {
+        // u-1 already has `display` set -- the add-exception does not apply to it
+        // specifically, even though a different entry (u-2) in the same array doesn't.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-1"].display"#),
+                Some(json!("Alicia")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("members".to_string()));
+    }
+
+    #[test]
+    fn schema_reports_no_matching_value_not_immutable_for_an_add_whose_filter_matches_nothing() {
+        // A filter matching zero entries has, vacuously, no previous value to protect --
+        // the real problem is "no target," which the existing array-matching loop already
+        // reports as NoMatchingValue once check_mutability lets the request through.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "nonexistent"].display"#),
+                Some(json!("Nobody")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::NoMatchingValue);
+    }
+
+    #[test]
+    fn schema_allows_add_on_immutable_sub_attribute_matched_by_a_compound_filter() {
+        // Adversarial: attribute_has_existing_value's evaluate() call must handle a
+        // compound (AND) value_filter identically to the real mutation loop's, not just
+        // a bare Filter::Compare -- otherwise the mutability gate and the actual write
+        // could resolve a different matched entry for anything beyond a single clause.
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-2" and type eq "User"].display"#),
+                Some(json!("Bob")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][1]["display"], "Bob");
+    }
+
+    /// A synthetic schema exercising an immutable sub-attribute under a *single-valued*
+    /// complex attribute (no real schema in this crate has one: `user_schema()`'s `name.*`
+    /// are all readWrite; only `group.members[].*` are immutable, and those are reached
+    /// via a bracket filter, not a plain dotted path). Proves `check_mutability`'s
+    /// "had no previous value" check is precise for the dotted-path case too, not just
+    /// the bracket-filtered one.
+    fn badge_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Badge".to_string(),
+            name: Some("Badge".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                sub_attributes: vec![
+                    crate::discovery::AttributeDefinition::simple(
+                        "level",
+                        "string",
+                        "Immutable badge level.",
+                        "immutable",
+                    ),
+                    crate::discovery::AttributeDefinition::simple(
+                        "note",
+                        "string",
+                        "Freely editable note.",
+                        "readWrite",
+                    ),
+                ],
+                ..crate::discovery::AttributeDefinition::simple(
+                    "profile",
+                    "complex",
+                    "The user's profile.",
+                    "readWrite",
+                )
+            }],
+        }
+    }
+
+    #[test]
+    fn schema_allows_add_on_a_dotted_immutable_sub_attribute_absent_from_an_existing_parent_object()
+    {
+        // `profile` already exists (with `note` set) but `profile.level` specifically does
+        // not -- the add-exception must key off `level`'s own presence, not `profile`'s.
+        let resource = json!({
+            "schemas": ["urn:test:Badge"],
+            "id": "b-1",
+            "profile": {"note": "hello"}
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Add, Some("profile.level"), Some(json!("gold")))],
+            &badge_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["profile"]["level"], "gold");
+        assert_eq!(result["profile"]["note"], "hello");
+    }
+
+    #[test]
+    fn schema_rejects_add_on_a_dotted_immutable_sub_attribute_that_already_has_a_value() {
+        let resource = json!({
+            "schemas": ["urn:test:Badge"],
+            "id": "b-1",
+            "profile": {"level": "silver"}
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Add, Some("profile.level"), Some(json!("gold")))],
+            &badge_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("profile".to_string()));
+    }
+
+    // --- Adversarial malformed-input safety (security-audit control test) ---
+
+    #[test]
+    fn immutable_add_check_never_panics_on_a_non_object_array_entry() {
+        // A malformed/adversarial resource where a "members" entry is a bare string
+        // instead of an object -- attribute_has_existing_value's entry.get(sub) and
+        // evaluate()'s resolve_scalar() must degrade to "no match"/"absent", never index
+        // or unwrap into a shape that isn't there. Asserting Result (not a panic) is the
+        // actual security property: a PATCH-processing library panicking on attacker
+        // input can take down the caller's whole request-handling thread.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": ["not-an-object", 42, null, {"value": "u-1"}]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-1"].display"#),
+                Some(json!("Bob")),
+            )],
+            &crate::group::group_schema(),
+        );
+        // Whatever the outcome, it must be a typed Result, not a panic -- reaching this
+        // assertion at all is the control test passing.
+        assert!(result.is_ok() || result.is_err());
     }
 
     #[test]
