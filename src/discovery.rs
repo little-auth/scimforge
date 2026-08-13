@@ -168,6 +168,91 @@ pub fn find_attribute<'a>(
     }
 }
 
+/// Resolves whether `attr_name`(.`sub_attr`) is `caseExact` per RFC 7643, consulting
+/// `schema`'s per-resource attribute table first (via [`find_attribute`]), then this
+/// crate's internal RFC 7643 §3.1 common-attributes table for the common attributes
+/// every resource type shares but no schema document redeclares (`id`, `externalId`,
+/// `meta.*`). `parent_attr` distinguishes the two shapes an
+/// attribute path can take: `None` resolves `attr_name`(.`sub_attr`) as a top-level
+/// path (e.g. `userName`, or `meta.resourceType`, the shape a search-filter's own
+/// `attrPath` takes -- RFC 7644 §3.4.2.2's `filter=externalId eq "x"`); `Some(parent)`
+/// resolves `attr_name` as `parent`'s sub-attribute instead (e.g. `"type"` inside a
+/// value-path bracket filter like `emails[type eq "work"]`, where `parent_attr` is
+/// `"emails"` and `attr_name` is `"type"` -- `attr_name` alone isn't a top-level schema
+/// attribute, so the parent context is required to resolve it correctly).
+///
+/// Anything this can't resolve folds case, matching RFC 7643 §2.2's stated default
+/// (`caseExact` `DEFAULT: false`) -- never the reverse, since defaulting to `caseExact`
+/// would silently break case-insensitive matching for everything this can't classify,
+/// to fix the much narrower set of attributes that are actually `caseExact`.
+///
+/// [`crate::patch`]'s schema-driven PATCH bracket-filter matching uses this internally
+/// (always with `parent_attr: Some(..)`, since it only ever compares one array entry's
+/// sub-attributes). It's `pub` here for a caller implementing their own search/list
+/// filter evaluation (`GET /Users?filter=...` against a whole collection) -- a
+/// storage-layer concern this crate deliberately doesn't implement (see
+/// [`crate::filter`]'s module doc) -- so they can resolve RFC 7643 `caseExact` for a
+/// parsed [`crate::filter::AttrPath`]'s `attr_name`/`sub_attr` (pass `parent_attr: None`
+/// for a top-level filter attribute, or the enclosing `valuePath`'s attribute name for
+/// one nested inside a value-path bracket filter) without re-deriving the RFC's rules,
+/// including the common attributes a per-resource `SchemaResource` alone can't answer.
+///
+/// ```
+/// use scimitar::discovery::is_case_exact;
+///
+/// // No schema, not a common attribute: folds, per RFC 7643 2.2's stated default.
+/// assert!(!is_case_exact(None, None, "userName", None));
+///
+/// // id/externalId/meta.resourceType/meta.version are RFC 7643 3.1 common attributes,
+/// // resolved even with no SchemaResource to consult (they're never in one).
+/// assert!(is_case_exact(None, None, "externalId", None));
+/// assert!(is_case_exact(None, None, "meta", Some("resourceType")));
+/// ```
+pub fn is_case_exact(
+    schema: Option<&SchemaResource>,
+    parent_attr: Option<&str>,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+) -> bool {
+    let (top, sub) = match parent_attr {
+        Some(parent) => (parent, Some(attr_name)),
+        None => (attr_name, sub_attr),
+    };
+    if let Some(schema) = schema
+        && let Some(attr_def) = find_attribute(schema, top, sub)
+    {
+        return attr_def.case_exact;
+    }
+    common_attribute_case_exact(top, sub).unwrap_or(false)
+}
+
+/// RFC 7643 §3.1 "Common Attributes" -- defined once for every resource type, not part
+/// of a specific resource's attribute table, so [`crate::user::user_schema`]/
+/// [`crate::group::group_schema`] don't redeclare them (matching how a real
+/// `/Schemas/User` document wouldn't either), meaning [`find_attribute`] alone always
+/// reports "not found" for these. Verified directly against the RFC 7643 §3.1
+/// characteristics text, not assumed: `id`, `externalId`, `meta.resourceType`, and
+/// `meta.version` are explicitly `caseExact: true`; `meta.created`, `meta.lastModified`,
+/// and `meta.location` have no `caseExact` stated, so they take §2.2's default (`false`).
+fn common_attribute_case_exact(attr_name: &str, sub_attr: Option<&str>) -> Option<bool> {
+    if attr_name.eq_ignore_ascii_case("id") && sub_attr.is_none() {
+        return Some(true);
+    }
+    if attr_name.eq_ignore_ascii_case("externalId") && sub_attr.is_none() {
+        return Some(true);
+    }
+    if attr_name.eq_ignore_ascii_case("meta")
+        && let Some(sub) = sub_attr
+    {
+        return match sub.to_ascii_lowercase().as_str() {
+            "resourcetype" | "version" => Some(true),
+            "created" | "lastmodified" | "location" => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// RFC 7643 §7. "Schema resources are read-only."
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaResource {
@@ -287,5 +372,125 @@ mod tests {
         };
         let json = serde_json::to_value(&name_attr).unwrap();
         assert_eq!(json["subAttributes"][0]["name"], "familyName");
+    }
+
+    // --- is_case_exact / common_attribute_case_exact ---
+
+    fn widget_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Widget".to_string(),
+            name: Some("Widget".to_string()),
+            description: None,
+            attributes: vec![
+                AttributeDefinition {
+                    case_exact: true,
+                    ..AttributeDefinition::simple(
+                        "serialNumber",
+                        "string",
+                        "Case-sensitive top-level attribute.",
+                        "readWrite",
+                    )
+                },
+                AttributeDefinition {
+                    multi_valued: true,
+                    sub_attributes: vec![
+                        AttributeDefinition {
+                            case_exact: true,
+                            ..AttributeDefinition::simple(
+                                "code",
+                                "string",
+                                "Case-sensitive sub-attribute.",
+                                "readWrite",
+                            )
+                        },
+                        AttributeDefinition::simple(
+                            "label",
+                            "string",
+                            "Case-insensitive sub-attribute.",
+                            "readWrite",
+                        ),
+                    ],
+                    ..AttributeDefinition::simple(
+                        "parts",
+                        "complex",
+                        "A list of parts.",
+                        "readWrite",
+                    )
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn is_case_exact_resolves_a_top_level_schema_attribute() {
+        // No parent_attr: attr_name/sub_attr are resolved as a top-level AttrPath, the
+        // shape a search-filter caller (e.g. `filter=serialNumber eq "X"`) would use.
+        let schema = widget_schema();
+        assert!(is_case_exact(Some(&schema), None, "serialNumber", None));
+        assert!(!is_case_exact(Some(&schema), None, "parts", None));
+    }
+
+    #[test]
+    fn is_case_exact_resolves_a_sub_attribute_of_a_multi_valued_parent() {
+        // parent_attr: Some -- the shape a value-path bracket filter's inner comparison
+        // uses (e.g. `parts[code eq "X"]`), resolving against the parent's sub-attribute
+        // table rather than treating "code" as a top-level attribute.
+        let schema = widget_schema();
+        assert!(is_case_exact(Some(&schema), Some("parts"), "code", None));
+        assert!(!is_case_exact(Some(&schema), Some("parts"), "label", None));
+    }
+
+    #[test]
+    fn is_case_exact_resolves_rfc_7643_section_3_1_common_attributes_with_no_schema_match() {
+        // id/externalId/meta.* are RFC 7643 3.1 common attributes, defined once for every
+        // resource type and never redeclared in a per-resource SchemaResource -- verified
+        // directly against the RFC 7643 3.1 characteristics text, not assumed: id,
+        // externalId, meta.resourceType, and meta.version are caseExact true; meta.created,
+        // meta.lastModified, and meta.location have no caseExact stated (default false).
+        assert!(is_case_exact(None, None, "id", None));
+        assert!(is_case_exact(None, None, "externalId", None));
+        assert!(is_case_exact(None, None, "meta", Some("resourceType")));
+        assert!(is_case_exact(None, None, "meta", Some("version")));
+        assert!(!is_case_exact(None, None, "meta", Some("created")));
+        assert!(!is_case_exact(None, None, "meta", Some("lastModified")));
+        assert!(!is_case_exact(None, None, "meta", Some("location")));
+    }
+
+    #[test]
+    fn is_case_exact_prefers_the_schema_over_the_common_attributes_table() {
+        // A schema that resolves the attribute wins over the common-attributes fallback,
+        // even for a name that collides with a common attribute -- schema is always the
+        // more specific, authoritative source when it has an opinion.
+        let schema = SchemaResource {
+            schemas: vec![SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Override".to_string(),
+            name: None,
+            description: None,
+            attributes: vec![AttributeDefinition {
+                case_exact: false,
+                ..AttributeDefinition::simple(
+                    "externalId",
+                    "string",
+                    "A schema that (unusually) redeclares externalId.",
+                    "readWrite",
+                )
+            }],
+        };
+        assert!(!is_case_exact(Some(&schema), None, "externalId", None));
+    }
+
+    #[test]
+    fn is_case_exact_folds_case_for_anything_it_cannot_resolve() {
+        // No schema, not a common attribute -- must fold (RFC 7643 2.2's stated default),
+        // never default to caseExact for an attribute this can't classify.
+        assert!(!is_case_exact(None, None, "userName", None));
+        let schema = widget_schema();
+        assert!(!is_case_exact(
+            Some(&schema),
+            Some("parts"),
+            "unmodeled",
+            None
+        ));
     }
 }

@@ -52,13 +52,21 @@ this was backwards. Schema-driven PATCH (`apply_patch_with_schema`) goes a step 
 PATCH's bracket-filter matching (e.g. `emails[type eq "work"]`) now consults the matched
 sub-attribute's actual `caseExact` from the schema instead of always folding -- if a
 resource type ever defines a `caseExact: true` sub-attribute of a multi-valued attribute,
-filtering on it compares literally. `id`, `externalId`, `meta.resourceType`, and
-`meta.version` are real RFC 7643 §3.1 `caseExact: true` examples (and `profileUrl` per
-§4.1), which is why this exists at all -- though none of them can themselves appear
-inside a bracket filter (they're resource-level attributes, never sub-attributes of a
-multi-valued one), so this crate carries a small lookup table for them ready for the day
-something needs it, not because PATCH filtering exercises it today. `apply_patch` (no
-schema) still always folds, since it has no schema to consult.
+filtering on it compares literally. `apply_patch` (no schema) still always folds, since
+it has no schema to consult.
+
+`id`, `externalId`, `meta.resourceType`, and `meta.version` are real RFC 7643 §3.1
+`caseExact: true` examples (and `profileUrl` per §4.1) -- but none of them can themselves
+appear inside a PATCH bracket filter (they're resource-level attributes, never
+sub-attributes of a multi-valued one). Where they *do* matter is a search/list filter
+(`GET /Users?filter=externalId eq "701984"`, the way a provisioning connector checks
+whether an account already exists before creating one) -- evaluating a filter against a
+whole collection is a storage-layer concern this crate deliberately doesn't implement
+(see the filter grammar module's own doc comment), so it can't run that query for you.
+What it can do is answer the RFC question underneath it: `discovery::is_case_exact` is
+`pub` for exactly this -- resolve `caseExact` for any attribute path, including the
+common ones no per-resource schema declares, so a caller writing their own filter
+evaluator doesn't have to re-derive RFC 7643's rules by hand.
 
 ## What's here
 
@@ -67,7 +75,7 @@ grammar (§3.4.2.2), full PATCH semantics including schema-driven mutability enf
 (§3.5.2), bulk operations with `bulkId` cross-referencing and dependency ordering
 (§3.7), discovery resources (ServiceProviderConfig/ResourceType/Schema, §5-7),
 ListResponse and pagination (§3.4.2), and the Error response shape with all ten
-canonical `scimType` keywords (§3.12, Table 9). 114 tests.
+canonical `scimType` keywords (§3.12, Table 9). 117 tests.
 
 ## Status
 
