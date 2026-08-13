@@ -23,6 +23,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test --all-targets
+      - name: doctest
+        run: cargo test --doc
+      - name: doc (fails on broken intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --lib
       - name: install cargo-audit
         run: cargo install cargo-audit --locked
       - name: dependency vulnerability audit
