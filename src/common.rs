@@ -32,6 +32,7 @@ impl ResourceId {
         ResourceId(server_assigned.into())
     }
 
+    /// Borrows the underlying string, e.g. for putting it into a JSON response body.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -49,6 +50,7 @@ impl ExternalId {
         ExternalId(client_supplied.into())
     }
 
+    /// Borrows the underlying string, e.g. for putting it into a JSON response body.
     pub fn as_str(&self) -> &str {
         &self.0
     }

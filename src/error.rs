@@ -52,6 +52,10 @@ pub enum ScimType {
 }
 
 impl ScimType {
+    /// The exact Table 9 keyword string -- always identical to what this variant
+    /// serializes to via its `#[serde(rename)]`, so a caller building an error body by
+    /// hand (rather than serializing a whole [`ScimError`]) still gets the RFC's literal
+    /// text.
     pub fn as_str(&self) -> &'static str {
         match self {
             ScimType::InvalidFilter => "invalidFilter",
@@ -82,6 +86,10 @@ pub struct ScimError {
 }
 
 impl ScimError {
+    /// Builds an Error response with `schemas` set to [`ERROR_SCHEMA_URI`] and `status`
+    /// converted to the RFC-required string form (e.g. `400` becomes `"400"`, matching
+    /// the RFC's own worked examples) -- a caller only supplies the HTTP status as a
+    /// plain `u16`, not a pre-stringified one.
     pub fn new(status: u16, scim_type: Option<ScimType>, detail: impl Into<String>) -> Self {
         ScimError {
             schemas: vec![ERROR_SCHEMA_URI.to_string()],
