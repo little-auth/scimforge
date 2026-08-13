@@ -1,0 +1,53 @@
+name: Keycloak Conformance (issue #1)
+
+# Deliberately a separate workflow from ci.yml's fast `test` job, not an extra step
+# folded into it: this exercises a real Keycloak instance plus a real third-party plugin
+# built from source via Gradle -- Docker startup time, a JVM build, and real network
+# timing between two live services, none of which belong in the fast/deterministic gate
+# every commit waits on. A slow or occasionally-flaky run here should never train anyone
+# to start ignoring red CI on the fast job. See the PR description's pre-mortem for the
+# full reasoning.
+#
+# Path-filtered rather than running on every push: this job is materially slower (a cold
+# Gradle build of the plugin plus Keycloak's own startup) and only meaningfully exercises
+# keycloak-it and scimitar's PATCH engine, so unrelated changes (docs, other modules)
+# don't pay for it. `workflow_dispatch` is included so it can still be run on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "keycloak-it/**"
+      - "src/patch.rs"
+      - ".github/workflows/keycloak-conformance.yml"
+  pull_request:
+    paths:
+      - "keycloak-it/**"
+      - "src/patch.rs"
+      - ".github/workflows/keycloak-conformance.yml"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: bring up Keycloak + mitodl/keycloak-scim
+        working-directory: keycloak-it/docker
+        run: docker compose up --build -d
+      - name: run the live conformance test against it
+        env:
+          KEYCLOAK_BASE_URL: http://localhost:8090
+        run: cargo test -p keycloak-it --test keycloak_conformance -- --ignored --nocapture
+      - name: Keycloak container logs (always, for diagnosing a failed run)
+        if: always()
+        working-directory: keycloak-it/docker
+        run: docker compose logs
+      - name: tear down
+        if: always()
+        working-directory: keycloak-it/docker
+        run: docker compose down -v
