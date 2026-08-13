@@ -1163,6 +1163,43 @@ mod tests {
         assert_eq!(common_attribute_case_exact("userName", None), None);
     }
 
+    #[test]
+    fn schema_aware_compound_filter_resolves_case_exact_independently_per_clause() {
+        // Adversarial: an AND-combined filter mixes a caseExact:true clause ("code") with
+        // a caseExact:false clause ("label") against the same entry -- Filter::And's
+        // recursion must thread parent_attr/schema into *both* sides independently, not
+        // drop it after the first recursive call.
+        let resource = resource_with_widgets();
+
+        // Wrong-case "code" (case-exact) must fail to match even though "label" matches
+        // case-insensitively -- proves the AND's left branch is truly case-exact.
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "abc" and label eq "SPROCKET"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::NoMatchingValue);
+
+        // Exact-case "code" plus wrong-case "label" (case-insensitive) must still match --
+        // proves the AND's right branch still folds.
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[code eq "ABC" and label eq "SPROCKET"].label"#),
+                Some(json!("Renamed")),
+            )],
+            &widget_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "Renamed");
+    }
+
     // --- Precise bracket-filtered immutable add-when-absent (issue #2) ---
 
     fn group_with_two_members() -> Value {
@@ -1235,6 +1272,26 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, PatchError::NoMatchingValue);
+    }
+
+    #[test]
+    fn schema_allows_add_on_immutable_sub_attribute_matched_by_a_compound_filter() {
+        // Adversarial: attribute_has_existing_value's evaluate() call must handle a
+        // compound (AND) value_filter identically to the real mutation loop's, not just
+        // a bare Filter::Compare -- otherwise the mutability gate and the actual write
+        // could resolve a different matched entry for anything beyond a single clause.
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-2" and type eq "User"].display"#),
+                Some(json!("Bob")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][1]["display"], "Bob");
     }
 
     /// A synthetic schema exercising an immutable sub-attribute under a *single-valued*
