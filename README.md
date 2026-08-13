@@ -63,10 +63,13 @@ sub-attributes of a multi-valued one). Where they *do* matter is a search/list f
 whether an account already exists before creating one) -- evaluating a filter against a
 whole collection is a storage-layer concern this crate deliberately doesn't implement
 (see the filter grammar module's own doc comment), so it can't run that query for you.
-What it can do is answer the RFC question underneath it: `discovery::is_case_exact` is
-`pub` for exactly this -- resolve `caseExact` for any attribute path, including the
+What it can do is answer the RFC question underneath it:
+[`discovery::is_case_exact`](https://docs.rs/scimitar/latest/scimitar/discovery/fn.is_case_exact.html)
+is `pub` for exactly this -- resolve `caseExact` for any attribute path, including the
 common ones no per-resource schema declares, so a caller writing their own filter
-evaluator doesn't have to re-derive RFC 7643's rules by hand.
+evaluator doesn't have to re-derive RFC 7643's rules by hand. (The link above will 404
+until this crate ships to crates.io -- see Status below -- but it's the right link once
+it does, so it stays.)
 
 ## What's here
 
