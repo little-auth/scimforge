@@ -1,0 +1,24 @@
+# Brings up a real Keycloak instance with the mitodl/keycloak-scim plugin installed, for
+# tests/keycloak_conformance.rs (GitHub issue #1). Dev-mode, no Postgres: this instance is
+# thrown away at the end of every run (ephemeral CI job or a developer's local `docker
+# compose down`), so the embedded dev datastore is simpler and faster than wiring up a
+# second service for state nothing needs to survive -- unlike the plugin's own
+# docker-compose.yml example, which persists to Postgres because it's meant for someone
+# poking at the admin console by hand, not a disposable CI run.
+services:
+  keycloak:
+    build:
+      context: .
+      dockerfile: Dockerfile.keycloak-scim
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8090:8080"
+    extra_hosts:
+      # Linux Docker has no automatic host.docker.internal -- the SCIM plugin's outbound
+      # requests need to reach keycloak-it's example server, which runs as a plain
+      # process on the CI runner's host (in-process with the test binary, not its own
+      # container -- see tests/keycloak_conformance.rs's module doc for why), not another
+      # compose service.
+      - "host.docker.internal:host-gateway"

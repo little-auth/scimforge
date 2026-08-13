@@ -1,0 +1,40 @@
+# Builds mitodl/keycloak-scim (a Keycloak SCIM *client* plugin: it turns Keycloak user/
+# group changes into outbound SCIM calls to an external service provider -- the direction
+# GitHub issue #1 needs, matching how Okta/Azure AD operate, not Keycloak's own newer
+# native SCIM *server* support) from a pinned source commit, then layers it onto Keycloak.
+#
+# Deliberately NOT following the project's own docs/container.md, which downloads a
+# prebuilt jar from a GitLab CI "latest artifact on main" URL -- that redirects to a
+# per-build-id link that can go stale or change shape without notice. Building from a
+# pinned commit here is slower (Gradle + a real compile on every image build) but
+# reproducible: this Dockerfile keeps working the same way regardless of what the
+# plugin's own CI infrastructure does later. See the PR description for the full
+# evaluation of why this plugin over the alternatives.
+
+# gradle:8-jdk17 (not the project's own .gitlab-ci.yml jdk11 image) because
+# keycloak-scim's build.gradle declares `java.sourceCompatibility = JavaVersion.VERSION_17`
+# -- using a JDK 17 Gradle image sidesteps relying on Gradle's toolchain
+# auto-provisioning to fetch a matching JDK on every build.
+FROM gradle:8-jdk17 AS plugin-builder
+WORKDIR /build
+# Pinned to the tip of `main` at the time this harness was researched (2026-08-13) --
+# verified to build with `gradle jar shadowjar`, the exact task their own
+# .gitlab-ci.yml `package` job runs.
+ARG KEYCLOAK_SCIM_COMMIT=eec8ecd14971886f0d00f3dc688b587c3002f252
+RUN git clone --no-checkout https://github.com/mitodl/keycloak-scim.git . \
+    && git checkout "${KEYCLOAK_SCIM_COMMIT}"
+RUN gradle jar shadowjar --no-daemon
+
+# quay.io/keycloak/keycloak:25.0.6 -- pinned to match keycloak-scim's build.gradle
+# `compileOnly org.keycloak:keycloak-*:25.0.6` (checked directly in build.gradle, not
+# assumed); a newer Keycloak risks Provider SPI drift the plugin's own build hasn't
+# caught up to.
+FROM quay.io/keycloak/keycloak:25.0.6 AS keycloak-builder
+COPY --from=plugin-builder /build/build/libs/keycloak-scim-1.0-SNAPSHOT-all.jar \
+    /opt/keycloak/providers/keycloak-scim-1.0-SNAPSHOT-all.jar
+RUN /opt/keycloak/bin/kc.sh build --health-enabled=true
+
+FROM quay.io/keycloak/keycloak:25.0.6
+COPY --from=keycloak-builder /opt/keycloak/ /opt/keycloak/
+ENTRYPOINT ["/opt/keycloak/bin/kc.sh"]
+CMD ["start-dev", "--health-enabled=true"]
