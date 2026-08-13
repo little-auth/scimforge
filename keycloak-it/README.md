@@ -101,8 +101,11 @@ The live CI run surfaced four things no amount of source-reading caught:
   image (applied via `git apply` in `Dockerfile.keycloak-scim`, see the patch file's own
   header for the full writeup), so this harness's live conformance test can actually
   prove the full create/update/delete lifecycle instead of giving up on a third of it.
-  Filed upstream at [mitodl/keycloak-scim#TBD](https://github.com/mitodl/keycloak-scim) --
-  remove the patch and the `git apply` step once an equivalent fix lands there and this
+  Filed upstream at
+  [mitodl/keycloak-scim#181](https://github.com/mitodl/keycloak-scim/issues/181), fix
+  proposed at
+  [mitodl/keycloak-scim#182](https://github.com/mitodl/keycloak-scim/pull/182) -- remove
+  the patch and the `git apply` step once an equivalent fix lands there and this
   harness's pinned `KEYCLOAK_SCIM_COMMIT` moves past it.
 
 - **The plugin gates every SCIM push on the Keycloak user's `emailVerified` flag.**
