@@ -95,6 +95,9 @@ impl<'de> Deserialize<'de> for BulkStatus {
 }
 
 impl BulkStatus {
+    /// A status with no `description` -- the common case, since `description` is
+    /// "OPTIONAL" per RFC 7644 §3.7.3 and most operations that succeed or fail for an
+    /// unremarkable reason don't need one.
     pub fn code(code: impl Into<String>) -> Self {
         BulkStatus {
             code: code.into(),
@@ -125,6 +128,10 @@ pub struct BulkResponse {
 }
 
 impl BulkResponse {
+    /// Wraps `operations` with `schemas` set to [`BULK_RESPONSE_SCHEMA_URI`] -- the
+    /// caller builds each [`BulkOperationResponse`] from executing
+    /// [`order_operations`]'s returned sequence against its own storage; this just
+    /// assembles the envelope RFC 7644 §3.7.3 wraps them in.
     pub fn new(operations: Vec<BulkOperationResponse>) -> Self {
         BulkResponse {
             schemas: vec![BULK_RESPONSE_SCHEMA_URI.to_string()],
@@ -315,6 +322,8 @@ pub struct BulkIdResolver {
 }
 
 impl BulkIdResolver {
+    /// Starts out with no known `bulkId -> real id` mappings; call [`Self::record`] as
+    /// the caller executes each POST in [`order_operations`]'s returned sequence.
     pub fn new() -> Self {
         BulkIdResolver::default()
     }
