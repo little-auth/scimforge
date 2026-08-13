@@ -33,6 +33,14 @@
 //! an 'immutable' attribute if the attribute had no previous value." [`apply_patch`]
 //! (no schema) still enforces the universal common-attribute protections unconditionally
 //! -- schema-driven checking is additive, not a replacement for that backstop.
+//!
+//! [`apply_patch_with_schema`] also coerces a PATCH `value` that's a JSON string into the
+//! attribute's declared scalar type (`boolean`/`integer`/`decimal`), but only for exact
+//! canonical string forms of that type (e.g. `"true"`, not `"True"`) -- real IdP traffic
+//! (GitHub issue #1: a real, actively-maintained Keycloak SCIM client plugin sends
+//! `boolean`-typed PATCH values as JSON strings via Java's `Boolean#toString()`), not a
+//! general lenient-type parser. [`apply_patch`] has no declared type to coerce to and
+//! never does this.
 
 use serde_json::{Map, Value};
 
@@ -341,6 +349,42 @@ fn apply_remove(
     }
 }
 
+/// Coerces `value` to the JSON-native form of `attr_def`'s declared scalar type when
+/// `value` is a JSON string that is an exact canonical textual representation of that
+/// type -- accommodating real SCIM clients that send PATCH `value`s for boolean/integer/
+/// decimal attributes as JSON strings rather than RFC 7643's native JSON types for them.
+/// Concrete evidence, not a hypothetical: mitodl/keycloak-scim (an actively-maintained
+/// Keycloak SCIM client plugin, see the crate README's real-IdP-conformance section)
+/// builds `active`'s PATCH replace op as `.value(active.toString())` -- Java
+/// `Boolean#toString()` is the JSON string `"true"`/`"false"`, not a native boolean.
+/// Anything that isn't an exact canonical form (wrong case, leading zeros, whitespace,
+/// non-finite) is left untouched rather than guessed at -- this accommodates one
+/// evidenced real sender, it isn't a general lenient-type parser. Only reachable from
+/// `apply_patch_with_schema`: `apply_patch` has no schema, so it has no declared type to
+/// coerce to, and keeps storing whatever JSON type it's given, unchanged.
+fn coerce_to_attribute_type(value: Value, attr_def: &discovery::AttributeDefinition) -> Value {
+    let Value::String(s) = &value else {
+        return value;
+    };
+    let coerced = match attr_def.type_.as_str() {
+        "boolean" if s == "true" => Some(Value::Bool(true)),
+        "boolean" if s == "false" => Some(Value::Bool(false)),
+        "integer" => s
+            .parse::<i64>()
+            .ok()
+            .filter(|n| n.to_string() == *s)
+            .map(|n| Value::Number(n.into())),
+        "decimal" => s
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        _ => None,
+    };
+    coerced.unwrap_or(value)
+}
+
 fn apply_add_or_replace(
     resource: &mut Value,
     operation: &PatchOperation,
@@ -408,10 +452,22 @@ fn apply_add_or_replace(
                     path.attr_path.attr_name
                 ))
             })?;
+            let value = match schema
+                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, Some(sub)))
+            {
+                Some(attr_def) => coerce_to_attribute_type(value, attr_def),
+                None => value,
+            };
             obj.insert(sub.clone(), value);
             Ok(())
         }
         (None, None) => {
+            let value = match schema
+                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None))
+            {
+                Some(attr_def) => coerce_to_attribute_type(value, attr_def),
+                None => value,
+            };
             match root.get_mut(&path.attr_path.attr_name) {
                 Some(existing @ Value::Array(_)) if !is_replace => {
                     // add onto a multi-valued attribute appends rather than overwriting.
@@ -443,7 +499,13 @@ fn apply_add_or_replace(
                     any_matched = true;
                     if let Some(sub) = &path.sub_attr_after_filter {
                         if let Value::Object(obj) = entry {
-                            obj.insert(sub.clone(), value.clone());
+                            let coerced = match schema.and_then(|s| {
+                                discovery::find_attribute(s, &path.attr_path.attr_name, Some(sub))
+                            }) {
+                                Some(attr_def) => coerce_to_attribute_type(value.clone(), attr_def),
+                                None => value.clone(),
+                            };
+                            obj.insert(sub.clone(), coerced);
                         }
                     } else {
                         *entry = value.clone();
@@ -1326,5 +1388,227 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PatchError::InvalidPath(_)));
+    }
+
+    // --- Schema-typed PATCH value coercion (real-IdP conformance, GitHub issue #1) ---
+    //
+    // mitodl/keycloak-scim (Apache-2.0, actively maintained -- see PR description for the
+    // full evaluation) builds its PATCH `active` op as
+    // `.path("active").op(PatchOp.REPLACE).value(active.toString())`
+    // (`UserAdapter.toPatchBuilder()`, pinned commit
+    // eec8ecd14971886f0d00f3dc688b587c3002f252) -- Java `Boolean#toString()` is the JSON
+    // *string* `"true"`/`"false"`, not RFC 7643's native JSON boolean for a
+    // `boolean`-typed attribute. A strict RFC-literal apply_patch_with_schema would store
+    // that string verbatim, silently corrupting the resource's type shape (a later
+    // `serde_json::from_value::<User>` would then fail on a field the SCIM server itself
+    // accepted). Coercion is deliberately narrow: only `apply_patch_with_schema` (which
+    // has a declared type to coerce *to*) does this, only for exact canonical string
+    // forms of the target type, and only boolean/integer/decimal -- anything else (wrong
+    // case, leading zeros, whitespace, non-numeric) passes through unchanged rather than
+    // being guessed at.
+
+    fn numeric_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Numeric".to_string(),
+            name: Some("Numeric".to_string()),
+            description: None,
+            attributes: vec![
+                crate::discovery::AttributeDefinition::simple(
+                    "loginCount",
+                    "integer",
+                    "Number of logins.",
+                    "readWrite",
+                ),
+                crate::discovery::AttributeDefinition::simple(
+                    "score",
+                    "decimal",
+                    "A decimal score.",
+                    "readWrite",
+                ),
+            ],
+        }
+    }
+
+    fn numeric_resource() -> Value {
+        json!({
+            "schemas": ["urn:test:Numeric"],
+            "id": "n-1",
+            "loginCount": 3,
+            "score": 1.5
+        })
+    }
+
+    #[test]
+    fn schema_coerces_a_string_true_to_boolean_for_a_boolean_typed_attribute() {
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!("true")))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!(true));
+    }
+
+    #[test]
+    fn schema_coerces_a_string_false_to_boolean_for_a_boolean_typed_attribute() {
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!("false")))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!(false));
+    }
+
+    #[test]
+    fn unscoped_apply_patch_never_coerces_since_it_has_no_schema_type_to_consult() {
+        let resource = user_with_emails();
+        let result = apply_patch(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!("true")))],
+        )
+        .unwrap();
+        // Stored verbatim as the string it was given -- apply_patch documents (module
+        // doc, src/patch.rs) that schema-driven behavior is additive, never assumed.
+        assert_eq!(result["active"], json!("true"));
+    }
+
+    #[test]
+    fn schema_coercion_rejects_a_wrong_case_boolean_string_as_a_near_miss() {
+        // "True" is not the canonical lowercase JSON/Java Boolean#toString() form --
+        // coercing it would be guessing, not accommodating an evidenced real sender.
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!("True")))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!("True"));
+    }
+
+    #[test]
+    fn schema_coerces_a_clean_integer_string_for_an_integer_typed_attribute() {
+        let resource = numeric_resource();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("loginCount"), Some(json!("42")))],
+            &numeric_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["loginCount"], json!(42));
+    }
+
+    #[test]
+    fn schema_coercion_rejects_a_leading_zero_integer_string_as_a_near_miss() {
+        // "007" round-trips through i64::parse but isn't canonical JSON integer text --
+        // coercing it would silently normalize a value the sender may not have intended
+        // as a number at all (e.g. a zero-padded code).
+        let resource = numeric_resource();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("loginCount"), Some(json!("007")))],
+            &numeric_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["loginCount"], json!("007"));
+    }
+
+    #[test]
+    fn schema_coercion_rejects_a_whitespace_padded_integer_string_as_a_near_miss() {
+        let resource = numeric_resource();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("loginCount"), Some(json!(" 42")))],
+            &numeric_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["loginCount"], json!(" 42"));
+    }
+
+    #[test]
+    fn schema_coerces_a_clean_decimal_string_for_a_decimal_typed_attribute() {
+        let resource = numeric_resource();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("score"), Some(json!("2.5")))],
+            &numeric_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["score"], json!(2.5));
+    }
+
+    #[test]
+    fn schema_coercion_rejects_a_non_finite_decimal_string_as_a_near_miss() {
+        // "Infinity"/"NaN" parse via f64::from_str but aren't representable in JSON
+        // (RFC 8259 4) -- must never be coerced into a Number.
+        let resource = numeric_resource();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("score"), Some(json!("Infinity")))],
+            &numeric_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["score"], json!("Infinity"));
+    }
+
+    #[test]
+    fn schema_coercion_leaves_non_numeric_strings_on_string_typed_attributes_untouched() {
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("displayName"),
+                Some(json!("Babs")),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["displayName"], json!("Babs"));
+    }
+
+    #[test]
+    fn schema_coerces_a_bracket_filtered_sub_attribute_value_too() {
+        // The same coercion applies wherever apply_add_or_replace resolves an attribute
+        // definition via schema, not just the plain top-level-path case -- exercised here
+        // against Group.members[].value's bracket-filter-matched-entry replace path (using
+        // a locally-declared boolean sub-attribute added onto the Group fixture schema
+        // rather than a real RFC 7643 one, since Group has no multi-valued boolean
+        // sub-attribute of its own).
+        let mut schema = crate::group::group_schema();
+        let members = schema
+            .attributes
+            .iter_mut()
+            .find(|a| a.name == "members")
+            .unwrap();
+        members
+            .sub_attributes
+            .push(crate::discovery::AttributeDefinition::simple(
+                "primary",
+                "boolean",
+                "Whether this is the primary membership record.",
+                "readWrite",
+            ));
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": "u-1", "type": "User", "primary": false}]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"].primary"#),
+                Some(json!("true")),
+            )],
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(result["members"][0]["primary"], json!(true));
     }
 }

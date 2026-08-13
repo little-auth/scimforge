@@ -176,9 +176,20 @@ canonical `scimType` keywords (§3.12, Table 9). 117 tests.
 
 Early. Not audited, not yet published to crates.io, and I'd tell you that even if it
 hurt adoption, because it's true and you should know it before you trust it with a
-production directory sync. Not yet built: real-IdP-conformance testing against actual
-Okta/Azure AD traffic (tracked in the issues -- needs a live consumer to test against,
-which this standalone library doesn't have yet).
+production directory sync.
+
+Real-IdP conformance testing (issue #1) now has a live consumer: `keycloak-it/` is a
+disposable example SCIM server built on this crate's own types, exercised in CI against a
+real Keycloak instance running [mitodl/keycloak-scim](https://github.com/mitodl/keycloak-scim)
+(an actively-maintained Keycloak SCIM client plugin -- Keycloak pushing provisioning
+events out, the same direction Okta/Azure AD operate in). One accommodation came out of
+that research directly, not from a live traffic capture (see `keycloak-it/`'s README for
+the full account, including why): `apply_patch_with_schema` now coerces a PATCH `value`
+that's an exact canonical string form of a `boolean`/`integer`/`decimal` attribute's
+declared type (e.g. `"true"`, not `"True"`) into that native JSON type, matching a
+real, currently-maintained Keycloak plugin's PATCH request shape
+(`.value(active.toString())` for a boolean attribute) instead of rejecting or
+silently mis-typing it.
 
 ## License
 
