@@ -182,5 +182,10 @@ which this standalone library doesn't have yet).
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Licensed under either of
+[Apache License, Version 2.0](https://github.com/mario/scimitar/blob/main/LICENSE-APACHE)
+or [MIT license](https://github.com/mario/scimitar/blob/main/LICENSE-MIT) at your option.
+(Relative links here would break once this README doubles as the crate's rustdoc front
+page via `#![doc = include_str!(...)]` -- rustdoc doesn't check plain markdown hyperlinks
+to local files the way it checks intra-doc `[`Type`]` links, so a relative path here would
+silently 404 on docs.rs without CI ever catching it.)
