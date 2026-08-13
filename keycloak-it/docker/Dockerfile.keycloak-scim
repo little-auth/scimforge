@@ -33,6 +33,12 @@ WORKDIR /keycloak-scim
 ARG KEYCLOAK_SCIM_COMMIT=eec8ecd14971886f0d00f3dc688b587c3002f252
 RUN git clone --no-checkout https://github.com/mitodl/keycloak-scim.git . \
     && git checkout "${KEYCLOAK_SCIM_COMMIT}"
+# Local mitigation, not upstream: fixes a real NullPointerException the plugin's own
+# event listener throws on every single Admin-API user DELETE (confirmed against a live
+# Keycloak run -- see the patch file's own header for the full root cause and the
+# upstream issue). Remove this COPY+RUN pair once that lands.
+COPY patches/0001-fix-delete-npe.patch /tmp/
+RUN git apply /tmp/0001-fix-delete-npe.patch
 RUN gradle jar shadowjar --no-daemon
 
 # quay.io/keycloak/keycloak:25.0.6 -- pinned to match keycloak-scim's build.gradle

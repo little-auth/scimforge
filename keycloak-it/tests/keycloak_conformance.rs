@@ -15,6 +15,18 @@
 //! cd keycloak-it/docker && docker compose up --build -d
 //! cargo test -p keycloak-it --test keycloak_conformance -- --ignored --nocapture
 //! ```
+//!
+//! The DELETE assertion below only passes because of
+//! `docker/patches/0001-fix-delete-npe.patch`. A live run against the unpatched, pinned
+//! plugin commit found `ScimEventListenerProvider.onEvent(AdminEvent, ..)`'s DELETE branch
+//! NullPointerExceptions every time: it calls `getUser(userId)` to check
+//! `user.isEmailVerified()` before dispatching, but by the time the DELETE admin event
+//! fires, Keycloak has already removed the user row, so `getUser` returns `null` and the
+//! unchecked `.isEmailVerified()` call throws -- the plugin's own event listener crashes
+//! before it ever builds the outbound SCIM request, so no DELETE reaches this server at
+//! all without the patch, no matter how long this test waits. See
+//! `keycloak-it/README.md`'s findings section for the exact stack trace and the patch's
+//! own header for the upstream fix this mitigates.
 
 use std::time::Duration;
 
@@ -118,7 +130,13 @@ impl KeycloakAdmin {
                     "auth-mode": ["BEARER"],
                     "auth-pass": [BEARER_TOKEN],
                     "propagation-user": ["true"],
-                    "propagation-group": ["false"]
+                    "propagation-group": ["false"],
+                    // Without this, ScimClient.replace() sends a full PUT (confirmed by a
+                    // live run: UserAdapter.toSCIM() serializes typed JSON, no coercion
+                    // needed) -- the plugin only takes the toPatchBuilder() path this
+                    // harness exists to exercise (active.toString(), a JSON *string*
+                    // "false"/"true") when user-patchOp is explicitly enabled.
+                    "user-patchOp": ["true"]
                 }
             }))
             .send()
@@ -332,6 +350,13 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
         println!("issue #1 finding -- active PATCH op value as sent: {op}");
     }
 
+    // Only reachable because of docker/patches/0001-fix-delete-npe.patch: unpatched, the
+    // plugin's own event listener NullPointerExceptions on every single Admin-API user
+    // DELETE (getUser(userId) always returns null by the time the DELETE admin event
+    // fires, and the DELETE branch calls user.isEmailVerified() without a null check), so
+    // no DELETE ever reaches this server at all -- see this function's module doc and
+    // keycloak-it/README.md's findings section for the exact stack trace, root cause, and
+    // the patch that fixes it.
     admin.delete_user(realm, &keycloak_user_id).await;
     let delete_entry = wait_for(
         "the example server to receive a DELETE for the removed user",
