@@ -48,7 +48,12 @@ One more spec detail worth calling out because it's easy to get backwards: RFC 7
 §2.2 says `caseExact` defaults to **false**, meaning case-*insensitive* comparison is
 the spec's stated default, not case-sensitive. Filter matching (`eq`, `co`, `sw`, `ew`)
 folds case unless told otherwise -- I found and fixed a real bug in an early build where
-this was backwards.
+this was backwards. Schema-driven PATCH (`apply_patch_with_schema`) goes a step further:
+it consults each attribute's actual `caseExact` from the schema (`id`, `externalId`,
+`meta.resourceType`, and `meta.version` are `caseExact: true` per RFC 7643 §3.1/§4.1, most
+other attributes aren't), so bracket-filter matching on those compares literally instead
+of folding. `apply_patch` (no schema) still always folds, since it has no schema to
+consult.
 
 ## What's here
 
@@ -57,7 +62,7 @@ grammar (§3.4.2.2), full PATCH semantics including schema-driven mutability enf
 (§3.5.2), bulk operations with `bulkId` cross-referencing and dependency ordering
 (§3.7), discovery resources (ServiceProviderConfig/ResourceType/Schema, §5-7),
 ListResponse and pagination (§3.4.2), and the Error response shape with all ten
-canonical `scimType` keywords (§3.12, Table 9). 96 tests.
+canonical `scimType` keywords (§3.12, Table 9). 110 tests.
 
 ## Status
 

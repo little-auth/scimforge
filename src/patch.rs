@@ -169,21 +169,15 @@ fn apply_one(
 /// 'readOnly' or 'immutable'... [but] MAY 'add' a value to an 'immutable' attribute if
 /// the attribute had no previous value" -- quoted verbatim since the "add exception"
 /// is easy to get subtly wrong (it's `add` specifically, not `add` or `replace`, and only
-/// when no previous value exists).
-///
-/// Precision note for the sub-attribute case (e.g. `members[value eq "x"].display`):
-/// "had no previous value" is checked against whether the *top-level* attribute
-/// (`members`) has any entries at all, not whether the one specific array entry the
-/// bracket filter matches already has that sub-attribute set. This makes the check
-/// conservative (may reject an add RFC 7644 would technically permit) rather than
-/// permissive (never allows one it shouldn't) -- `replace`/`remove` on an immutable
-/// sub-attribute are rejected unconditionally either way, which is the higher-value,
-/// unambiguous case this exists to catch.
+/// when no previous value exists). `replace`/`remove` on an immutable attribute are
+/// rejected unconditionally regardless of `value_filter`, so `has_existing` below is only
+/// ever actually evaluated for `op == PatchOp::Add`.
 fn check_mutability(
     schema: &SchemaResource,
     resource: &Value,
     attr_name: &str,
     sub_attr: Option<&str>,
+    value_filter: Option<&Filter>,
     op: PatchOp,
 ) -> Result<(), PatchError> {
     let Some(attr_def) = discovery::find_attribute(schema, attr_name, sub_attr) else {
@@ -197,9 +191,13 @@ fn check_mutability(
         Mutability::ReadOnly => Err(PatchError::ImmutableOrReadOnly(attr_name.to_string())),
         Mutability::Immutable => {
             let has_existing = op != PatchOp::Add
-                || resource
-                    .get(attr_name)
-                    .is_some_and(|v| !matches!(v, Value::Null));
+                || attribute_has_existing_value(
+                    resource,
+                    attr_name,
+                    sub_attr,
+                    value_filter,
+                    schema,
+                );
             if has_existing {
                 Err(PatchError::ImmutableOrReadOnly(attr_name.to_string()))
             } else {
@@ -207,6 +205,46 @@ fn check_mutability(
             }
         }
         Mutability::ReadWrite | Mutability::WriteOnly => Ok(()),
+    }
+}
+
+/// Whether `attr_name`(.`sub_attr`) already has a value on `resource`, precisely --
+/// consulting the specific bracket-filter-matched array entry when `value_filter` is
+/// `Some` (e.g. `members[value eq "x"].display`), and the specific sub-attribute of a
+/// plain dotted path otherwise (e.g. `profile.level`), rather than only whether the
+/// top-level attribute is present at all. That coarser check is [`check_mutability`]'s
+/// only source of imprecision in the immutable "had no previous value" add-exception --
+/// `replace`/`remove` reject unconditionally regardless, so this is never consulted for
+/// them.
+fn attribute_has_existing_value(
+    resource: &Value,
+    attr_name: &str,
+    sub_attr: Option<&str>,
+    value_filter: Option<&Filter>,
+    schema: &SchemaResource,
+) -> bool {
+    match (
+        value_filter,
+        resource.get(attr_name).and_then(Value::as_array),
+    ) {
+        (Some(filter), Some(array)) => array
+            .iter()
+            .filter(|entry| evaluate(filter, entry, attr_name, Some(schema)))
+            .any(|entry| match sub_attr {
+                Some(sub) => entry.get(sub).is_some_and(|v| !matches!(v, Value::Null)),
+                // A matched entry existing at all is itself "a previous value" when the
+                // path targets no sub-attribute (e.g. a whole-entry replace target).
+                None => true,
+            }),
+        _ => match sub_attr {
+            Some(sub) => resource
+                .get(attr_name)
+                .and_then(|v| v.get(sub))
+                .is_some_and(|v| !matches!(v, Value::Null)),
+            None => resource
+                .get(attr_name)
+                .is_some_and(|v| !matches!(v, Value::Null)),
+        },
     }
 }
 
@@ -241,6 +279,7 @@ fn apply_remove(
             resource,
             &path.attr_path.attr_name,
             effective_sub_attr(&path),
+            path.value_filter.as_ref(),
             PatchOp::Remove,
         )?;
     }
@@ -290,7 +329,9 @@ fn apply_remove(
                     return Err(PatchError::NoMatchingValue);
                 }
             } else {
-                array.retain(|entry| !evaluate(value_filter, entry, &path.attr_path.attr_name, schema));
+                array.retain(|entry| {
+                    !evaluate(value_filter, entry, &path.attr_path.attr_name, schema)
+                });
                 if array.len() == before {
                     return Err(PatchError::NoMatchingValue);
                 }
@@ -326,7 +367,7 @@ fn apply_add_or_replace(
                 return Err(PatchError::Protected(key.clone()));
             }
             if let Some(schema) = schema {
-                check_mutability(schema, resource, key, None, op_kind)?;
+                check_mutability(schema, resource, key, None, None, op_kind)?;
             }
         }
         let root = resource.as_object_mut().ok_or_else(|| {
@@ -348,6 +389,7 @@ fn apply_add_or_replace(
             resource,
             &path.attr_path.attr_name,
             effective_sub_attr(&path),
+            path.value_filter.as_ref(),
             op_kind,
         )?;
     }
@@ -428,7 +470,12 @@ fn apply_add_or_replace(
 /// `schema` to resolve the filter's own attribute (e.g. `"type"`) as that parent's
 /// sub-attribute for `caseExact` lookup, since [`discovery::find_attribute`] otherwise
 /// has no way to know `"type"` isn't a top-level schema attribute.
-fn evaluate(filter: &Filter, value: &Value, parent_attr: &str, schema: Option<&SchemaResource>) -> bool {
+fn evaluate(
+    filter: &Filter,
+    value: &Value,
+    parent_attr: &str,
+    schema: Option<&SchemaResource>,
+) -> bool {
     match filter {
         Filter::Present(path) => resolve_scalar(path, value).is_some_and(|v| !is_empty(v)),
         Filter::Compare(path, op, comp) => resolve_scalar(path, value).is_some_and(|v| {
@@ -1114,6 +1161,153 @@ mod tests {
             Some(false)
         );
         assert_eq!(common_attribute_case_exact("userName", None), None);
+    }
+
+    // --- Precise bracket-filtered immutable add-when-absent (issue #2) ---
+
+    fn group_with_two_members() -> Value {
+        json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [
+                {"value": "u-1", "type": "User", "display": "Alice"},
+                {"value": "u-2", "type": "User"}
+            ]
+        })
+    }
+
+    #[test]
+    fn schema_allows_add_on_an_immutable_sub_attribute_when_the_matched_entry_has_no_prior_value() {
+        // u-2 has no `display` set yet -- RFC 7644 3.5.2's add-exception should allow it,
+        // even though the top-level `members` array has other entries (u-1) that do have
+        // `display` set. The old conservative check rejected this.
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-2"].display"#),
+                Some(json!("Bob")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        let members = result["members"].as_array().unwrap();
+        assert_eq!(members[1]["display"], "Bob");
+        // u-1's existing display is untouched.
+        assert_eq!(members[0]["display"], "Alice");
+    }
+
+    #[test]
+    fn schema_rejects_add_on_an_immutable_sub_attribute_when_the_matched_entry_already_has_a_value()
+    {
+        // u-1 already has `display` set -- the add-exception does not apply to it
+        // specifically, even though a different entry (u-2) in the same array doesn't.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "u-1"].display"#),
+                Some(json!("Alicia")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("members".to_string()));
+    }
+
+    #[test]
+    fn schema_reports_no_matching_value_not_immutable_for_an_add_whose_filter_matches_nothing() {
+        // A filter matching zero entries has, vacuously, no previous value to protect --
+        // the real problem is "no target," which the existing array-matching loop already
+        // reports as NoMatchingValue once check_mutability lets the request through.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"members[value eq "nonexistent"].display"#),
+                Some(json!("Nobody")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::NoMatchingValue);
+    }
+
+    /// A synthetic schema exercising an immutable sub-attribute under a *single-valued*
+    /// complex attribute (no real schema in this crate has one: `user_schema()`'s `name.*`
+    /// are all readWrite; only `group.members[].*` are immutable, and those are reached
+    /// via a bracket filter, not a plain dotted path). Proves `check_mutability`'s
+    /// "had no previous value" check is precise for the dotted-path case too, not just
+    /// the bracket-filtered one.
+    fn badge_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Badge".to_string(),
+            name: Some("Badge".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                sub_attributes: vec![
+                    crate::discovery::AttributeDefinition::simple(
+                        "level",
+                        "string",
+                        "Immutable badge level.",
+                        "immutable",
+                    ),
+                    crate::discovery::AttributeDefinition::simple(
+                        "note",
+                        "string",
+                        "Freely editable note.",
+                        "readWrite",
+                    ),
+                ],
+                ..crate::discovery::AttributeDefinition::simple(
+                    "profile",
+                    "complex",
+                    "The user's profile.",
+                    "readWrite",
+                )
+            }],
+        }
+    }
+
+    #[test]
+    fn schema_allows_add_on_a_dotted_immutable_sub_attribute_absent_from_an_existing_parent_object()
+    {
+        // `profile` already exists (with `note` set) but `profile.level` specifically does
+        // not -- the add-exception must key off `level`'s own presence, not `profile`'s.
+        let resource = json!({
+            "schemas": ["urn:test:Badge"],
+            "id": "b-1",
+            "profile": {"note": "hello"}
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Add, Some("profile.level"), Some(json!("gold")))],
+            &badge_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["profile"]["level"], "gold");
+        assert_eq!(result["profile"]["note"], "hello");
+    }
+
+    #[test]
+    fn schema_rejects_add_on_a_dotted_immutable_sub_attribute_that_already_has_a_value() {
+        let resource = json!({
+            "schemas": ["urn:test:Badge"],
+            "id": "b-1",
+            "profile": {"level": "silver"}
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Add, Some("profile.level"), Some(json!("gold")))],
+            &badge_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("profile".to_string()));
     }
 
     #[test]
