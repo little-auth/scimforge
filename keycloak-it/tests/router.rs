@@ -211,3 +211,107 @@ async fn the_captured_diagnostic_endpoint_records_the_raw_patch_body_verbatim() 
     // capturing what actually arrived, not a post-coercion reconstruction.
     assert_eq!(patch_entry["body"]["Operations"][0]["value"], json!("true"));
 }
+
+#[tokio::test]
+async fn patching_password_never_echoes_or_persists_the_plaintext_value() {
+    // Regression for a high-severity info-disclosure bug: PATCH used to operate on the
+    // raw stored JSON instead of the typed User, so a client-supplied password (schema
+    // mutability writeOnly, not blocked by check_mutability) was merged straight in and
+    // survived into the PATCH response, the persisted record, and every future GET.
+    let router = app();
+
+    let (_, created) = send(
+        router.clone(),
+        authed("POST", "/Users")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&keycloak_style_create_body()))
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let patch_body = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "replace", "path": "password", "value": "hunter2-plaintext"}
+        ]
+    });
+
+    let (status, patch_response) = send(
+        router.clone(),
+        authed("PATCH", &format!("/Users/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&patch_body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        patch_response.get("password").is_none(),
+        "PATCH response must never echo the plaintext password: {patch_response}"
+    );
+
+    let (_, get_response) = send(
+        router,
+        authed("GET", &format!("/Users/{id}")).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        get_response.get("password").is_none(),
+        "a later GET must not leak the persisted plaintext password: {get_response}"
+    );
+}
+
+#[tokio::test]
+async fn patching_a_group_with_an_unmodeled_attribute_does_not_persist_it() {
+    // Regression: groups::patch used to persist the raw merged serde_json::Value
+    // directly, unlike users::patch's typed round-trip -- group_schema() only models
+    // displayName/members, so a client PATCHing in an attribute name outside that set
+    // (not id/meta/schemas, which the crate's universal PROTECTED_TOP_LEVEL guard
+    // already blocks) sailed straight through unmodeled_attribute's ReadWrite fallback
+    // and persisted indefinitely, served back on every later GET/LIST.
+    let router = app();
+
+    let (_, created) = send(
+        router.clone(),
+        authed("POST", "/Groups")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                "displayName": "Engineering",
+            })))
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let patch_body = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "add", "value": {"smuggledAttribute": "attacker-controlled"}}
+        ]
+    });
+    let (status, patch_response) = send(
+        router.clone(),
+        authed("PATCH", &format!("/Groups/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&patch_body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        patch_response.get("smuggledAttribute").is_none(),
+        "PATCH response must not echo an attribute outside the Group schema: {patch_response}"
+    );
+
+    let (_, get_response) = send(
+        router,
+        authed("GET", &format!("/Groups/{id}")).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert!(
+        get_response.get("smuggledAttribute").is_none(),
+        "a later GET must not serve back a smuggled unmodeled attribute: {get_response}"
+    );
+}

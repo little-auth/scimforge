@@ -1,6 +1,7 @@
 //! RFC 7643 §4.1 (Core User) and §4.3 (Enterprise User extension) resource schemas.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::common::{ExternalId, Meta, ResourceId};
 use crate::discovery::{AttributeDefinition, SchemaResource};
@@ -80,6 +81,79 @@ pub struct GroupRef {
     pub type_: Option<String>,
 }
 
+/// Wrapper around a user's password value that keeps it out of `Debug` output.
+///
+/// SCIM servers routinely log inbound provisioning requests -- `tracing::debug!(?user,
+/// ...)` or an ad hoc `format!("{user:?}")` while troubleshooting a sync job -- and
+/// because [`User`] derives `Debug`, a bare `Option<String>` field would print the
+/// cleartext password verbatim into logs. `Password` exists so `User` can keep
+/// `#[derive(Debug)]` for its many other fields while this one field is safe by
+/// construction: its hand-written `Debug` impl always emits a fixed `"[REDACTED]"`
+/// placeholder, whether the value is present or not, so the length of the password (and
+/// even whether one was supplied) never leaks into logs either.
+///
+/// Serialization is unaffected: `#[serde(transparent)]` makes `Password` serialize and
+/// deserialize exactly as a bare `Option<String>` would, so the existing
+/// `#[serde(default, skip_serializing)]` annotation on `User::password` continues to work
+/// unchanged.
+///
+/// Equality avoids the default derived structural comparison, which would short-circuit
+/// byte-by-byte on the first mismatch and let an attacker who can measure comparison
+/// timing recover a secret one byte at a time. Once both sides are known to be `Some`
+/// values of equal length, the actual byte content is compared in constant time (an
+/// XOR-fold with no early return). A `None`/`Some` mismatch or a length mismatch still
+/// returns immediately without folding -- this matches the documented behavior of
+/// established constant-time comparison primitives (Go's `crypto/subtle.
+/// ConstantTimeCompare`, Python's `hmac.compare_digest`): the guarantee is about not
+/// leaking *which bytes* differ once presence and length are already known, not about
+/// hiding presence or length themselves.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Password(Option<String>);
+
+impl Password {
+    /// Mirrors `Option::as_deref` rather than exposing a blanket `Deref<Target =
+    /// Option<String>>` -- a generic `Deref` impl lets a caller explicitly dereference
+    /// past this type (`*user.password`, `&*user.password`) to obtain the raw
+    /// `Option<String>` and format *that* with its own std `Debug` impl instead of
+    /// [`Password`]'s redacted one, defeating the entire point of this type for the cost
+    /// of one extra `*`. A named method returning `Option<&str>` gives every legitimate
+    /// caller (comparing/hashing/persisting the value) the exact same access, without
+    /// also handing out a route to the wrapped `Option<String>` itself.
+    pub fn as_deref(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+}
+
+impl From<Option<String>> for Password {
+    fn from(value: Option<String>) -> Self {
+        Password(value)
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
+impl PartialEq for Password {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.len() == b.len()
+                    && a.as_bytes()
+                        .iter()
+                        .zip(b.as_bytes())
+                        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                        == 0
+            }
+            _ => false,
+        }
+    }
+}
+
 /// RFC 7643 §4.1 Core User resource. `id`/`externalId`/`meta` are `Option` because they
 /// don't exist yet on a resource a client is POSTing to create -- the server assigns
 /// `id` and `meta`; `externalId` may or may not be supplied by the client.
@@ -122,9 +196,11 @@ pub struct User {
     /// create/replace request body needs to read the supplied password), never
     /// serializable, so leaking it into a response is a compile-time-enforced
     /// impossibility for any caller that reuses this type for output, not a discipline
-    /// requirement on whoever builds the response.
+    /// requirement on whoever builds the response. Wrapped in [`Password`] rather than a
+    /// bare `Option<String>` so it also never leaks into `Debug`/log output and so
+    /// equality on it is constant-time.
     #[serde(default, skip_serializing)]
-    pub password: Option<String>,
+    pub password: Password,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emails: Vec<MultiValuedString>,
@@ -333,11 +409,26 @@ pub fn user_schema() -> SchemaResource {
                         "readOnly",
                     ),
                     AttributeDefinition::simple(
+                        "$ref",
+                        "reference",
+                        "The URI of the corresponding Group resource.",
+                        "readOnly",
+                    ),
+                    AttributeDefinition::simple(
                         "display",
                         "string",
                         "A human-readable name for the Group.",
                         "readOnly",
                     ),
+                    AttributeDefinition {
+                        canonical_values: vec!["direct".to_string(), "indirect".to_string()],
+                        ..AttributeDefinition::simple(
+                            "type",
+                            "string",
+                            "A label indicating the attribute's function; e.g., 'direct' or 'indirect'.",
+                            "readOnly",
+                        )
+                    },
                 ],
                 ..AttributeDefinition::simple(
                     "groups",
@@ -447,6 +538,12 @@ pub fn enterprise_user_schema() -> SchemaResource {
                         "readWrite",
                     ),
                     AttributeDefinition::simple(
+                        "$ref",
+                        "reference",
+                        "The URI of the SCIM resource representing the user's manager.",
+                        "readWrite",
+                    ),
+                    AttributeDefinition::simple(
                         "displayName",
                         "string",
                         "The displayName of the user's manager.",
@@ -546,6 +643,14 @@ mod tests {
         let manager_display_name = find_attribute(&schema, "manager", Some("displayName"))
             .expect("manager.displayName must be a resolvable sub-attribute");
         assert_eq!(manager_display_name.mutability, "readOnly");
+        // Regression: manager.$ref was previously unmodeled, so find_attribute returned
+        // None for it and check_mutability's unmodeled-attribute fallback resolved it as
+        // ReadWrite by coincidence rather than by declaration -- explicitly modeling it
+        // (same as manager.value) makes that intended, not accidental.
+        let manager_ref = find_attribute(&schema, "manager", Some("$ref"))
+            .expect("manager.$ref must be a resolvable sub-attribute");
+        assert_eq!(manager_ref.type_, "reference");
+        assert_eq!(manager_ref.mutability, "readWrite");
     }
 
     fn minimal_user() -> User {
@@ -565,7 +670,7 @@ mod tests {
             locale: None,
             timezone: None,
             active: None,
-            password: None,
+            password: Password(None),
             emails: vec![],
             phone_numbers: vec![],
             ims: vec![],
@@ -620,6 +725,43 @@ mod tests {
             !serialized.contains("password"),
             "'password' key present in output at all: {serialized}"
         );
+    }
+
+    #[test]
+    fn password_never_leaks_the_cleartext_value_into_debug_output() {
+        let with_value = Password(Some("correct horse battery staple".to_string()));
+        let without_value = Password(None);
+        assert_eq!(format!("{with_value:?}"), "[REDACTED]");
+        assert_eq!(format!("{without_value:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn password_as_deref_still_works_without_a_blanket_deref_escape_hatch() {
+        // Regression: Password's tuple field used to be `pub` and Deref<Target =
+        // Option<String>> exposed the whole wrapped value, so `user.password.0` or
+        // `*user.password` bypassed Password's own Debug entirely and printed the
+        // std Option<String> Debug output (the plaintext) instead. This test's real
+        // assertion is at compile time: the tuple field is private and there is no
+        // Deref impl, so neither `.0` nor `*password` compiles from outside this
+        // module -- only the purpose-built as_deref() method (which returns a plain
+        // Option<&str>, the same thing any legitimate caller needs) is available.
+        let with_value = Password(Some("correct horse battery staple".to_string()));
+        assert_eq!(with_value.as_deref(), Some("correct horse battery staple"));
+        assert_eq!(Password(None).as_deref(), None);
+    }
+
+    #[test]
+    fn password_equality_compares_content_not_identity() {
+        assert_eq!(
+            Password(Some("secret".to_string())),
+            Password(Some("secret".to_string()))
+        );
+        assert_ne!(
+            Password(Some("secret".to_string())),
+            Password(Some("different".to_string()))
+        );
+        assert_ne!(Password(Some("secret".to_string())), Password(None));
+        assert_eq!(Password(None), Password(None));
     }
 
     #[test]

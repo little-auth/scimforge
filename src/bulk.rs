@@ -13,7 +13,8 @@
 //! serializes (the object form), and deserializes either shape leniently, since a real
 //! IdP client parsing a bulk response might have been built against either example.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -158,20 +159,25 @@ pub enum BulkError {
     /// RFC 7644 §3.7.4: either `maxOperations` or `maxPayloadSize` was exceeded. Maps to
     /// HTTP 413 per the spec ("the service provider MUST return HTTP response code 413").
     TooLarge(String),
+    /// An operation's `data` nested (via `Value::Array`/`Value::Object`) deeper than
+    /// [`MAX_DEPTH`] -- mirrors [`crate::filter::FilterError::TooDeep`]'s defense against
+    /// the identical class of bug.
+    TooDeep,
 }
 
 impl BulkError {
-    /// The three `bulkId`-shape errors are request-syntax problems RFC 7644 §3.12 Table
-    /// 9 classifies as `invalidValue` (400); `CircularReference` maps to 409 per §3.7.1's
-    /// own text, which specifies the status code directly and doesn't assign it a
-    /// `scimType` at all; `TooLarge` maps to 413 per §3.7.4, likewise with no `scimType`
-    /// (§3.7.4's example body is `{"maxOperations": ..., "maxPayloadSize": ...}`, not the
-    /// `schemas`/`scimType`/`detail` Error shape).
+    /// The three `bulkId`-shape errors, plus `TooDeep`, are request-syntax problems RFC
+    /// 7644 §3.12 Table 9 classifies as `invalidValue` (400); `CircularReference` maps to
+    /// 409 per §3.7.1's own text, which specifies the status code directly and doesn't
+    /// assign it a `scimType` at all; `TooLarge` maps to 413 per §3.7.4, likewise with no
+    /// `scimType` (§3.7.4's example body is `{"maxOperations": ..., "maxPayloadSize":
+    /// ...}`, not the `schemas`/`scimType`/`detail` Error shape).
     pub fn scim_type(&self) -> Option<crate::error::ScimType> {
         match self {
             BulkError::MissingBulkIdOnPost(_)
             | BulkError::DuplicateBulkId(_)
-            | BulkError::UnresolvedBulkId(_) => Some(crate::error::ScimType::InvalidValue),
+            | BulkError::UnresolvedBulkId(_)
+            | BulkError::TooDeep => Some(crate::error::ScimType::InvalidValue),
             BulkError::CircularReference | BulkError::TooLarge(_) => None,
         }
     }
@@ -180,7 +186,8 @@ impl BulkError {
         match self {
             BulkError::MissingBulkIdOnPost(_)
             | BulkError::DuplicateBulkId(_)
-            | BulkError::UnresolvedBulkId(_) => 400,
+            | BulkError::UnresolvedBulkId(_)
+            | BulkError::TooDeep => 400,
             BulkError::CircularReference => 409,
             BulkError::TooLarge(_) => 413,
         }
@@ -211,12 +218,29 @@ pub fn check_limits(
 
 const BULK_ID_PREFIX: &str = "bulkId:";
 
+/// Recursion depth limit shared by [`find_bulk_id_refs`] and [`BulkIdResolver::substitute`]
+/// -- both walk an operation's attacker-controlled `data` tree, which RFC 7644 places no
+/// nesting bound on. Mirrors [`crate::filter::MAX_DEPTH`]'s same value and same rationale.
+pub const MAX_DEPTH: usize = 32;
+
+fn check_depth(depth: usize) -> Result<(), BulkError> {
+    if depth > MAX_DEPTH {
+        Err(BulkError::TooDeep)
+    } else {
+        Ok(())
+    }
+}
+
 /// Every `bulkId:xxx` reference reachable in `data`, found by walking the whole JSON
 /// tree -- RFC 7644 §3.7.2's own example uses this inside `members[].value`, and §3.7.2's
 /// closing paragraph explicitly generalizes it to extension attributes too ("Extensions
 /// that include references to other resources MUST be handled in the same way"), so this
 /// walks every string value rather than special-casing known field names.
-fn find_bulk_id_refs(data: &Value, out: &mut HashSet<String>) {
+///
+/// `depth` is checked against [`MAX_DEPTH`] before recursing further, since `data` is
+/// attacker-controlled and RFC 7644 imposes no nesting bound.
+fn find_bulk_id_refs(data: &Value, out: &mut HashSet<String>, depth: usize) -> Result<(), BulkError> {
+    check_depth(depth)?;
     match data {
         Value::String(s) => {
             if let Some(id) = s.strip_prefix(BULK_ID_PREFIX) {
@@ -225,16 +249,17 @@ fn find_bulk_id_refs(data: &Value, out: &mut HashSet<String>) {
         }
         Value::Array(items) => {
             for item in items {
-                find_bulk_id_refs(item, out);
+                find_bulk_id_refs(item, out, depth + 1)?;
             }
         }
         Value::Object(obj) => {
             for v in obj.values() {
-                find_bulk_id_refs(v, out);
+                find_bulk_id_refs(v, out, depth + 1)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Returns indices into `operations` in dependency order: an operation referencing
@@ -260,7 +285,7 @@ pub fn order_operations(operations: &[BulkOperationRequest]) -> Result<Vec<usize
     for op in operations {
         let mut refs = HashSet::new();
         if let Some(data) = &op.data {
-            find_bulk_id_refs(data, &mut refs);
+            find_bulk_id_refs(data, &mut refs, 0)?;
         }
         let mut dep_indices = HashSet::new();
         for r in &refs {
@@ -289,20 +314,17 @@ pub fn order_operations(operations: &[BulkOperationRequest]) -> Result<Vec<usize
         }
     }
 
-    let mut ready: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+    let mut ready: BinaryHeap<Reverse<usize>> = (0..n)
+        .filter(|&i| in_degree[i] == 0)
+        .map(Reverse)
+        .collect();
     let mut order = Vec::with_capacity(n);
-    while let Some(pos) = ready
-        .iter()
-        .enumerate()
-        .min_by_key(|&(_, &idx)| idx)
-        .map(|(pos, _)| pos)
-    {
-        let i = ready.remove(pos);
+    while let Some(Reverse(i)) = ready.pop() {
         order.push(i);
         for &dependent in &dependents[i] {
             in_degree[dependent] -= 1;
             if in_degree[dependent] == 0 {
-                ready.push(dependent);
+                ready.push(Reverse(dependent));
             }
         }
     }
@@ -339,6 +361,11 @@ impl BulkIdResolver {
     /// [`order_operations`]'s order and calls [`Self::record`] after each POST, can only
     /// happen for a genuinely unresolved reference, not an ordering mistake.
     pub fn substitute(&self, data: &Value) -> Result<Value, BulkError> {
+        self.substitute_at_depth(data, 0)
+    }
+
+    fn substitute_at_depth(&self, data: &Value, depth: usize) -> Result<Value, BulkError> {
+        check_depth(depth)?;
         match data {
             Value::String(s) => match s.strip_prefix(BULK_ID_PREFIX) {
                 Some(id) => match self.known.get(id) {
@@ -350,14 +377,14 @@ impl BulkIdResolver {
             Value::Array(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
-                    out.push(self.substitute(item)?);
+                    out.push(self.substitute_at_depth(item, depth + 1)?);
                 }
                 Ok(Value::Array(out))
             }
             Value::Object(obj) => {
                 let mut out = serde_json::Map::with_capacity(obj.len());
                 for (k, v) in obj {
-                    out.insert(k.clone(), self.substitute(v)?);
+                    out.insert(k.clone(), self.substitute_at_depth(v, depth + 1)?);
                 }
                 Ok(Value::Object(out))
             }
@@ -610,5 +637,58 @@ mod tests {
             operations: vec![post("a", "/Users", json!({}))],
         };
         assert!(check_limits(&req, 1000, 1_048_576, 200).is_ok());
+    }
+
+    /// Builds a `Value` nested `depth` levels deep in `Value::Array`s around a scalar
+    /// leaf -- the `[[[[...]]]]` shape that sails past `check_limits`'s operation-count
+    /// and byte-size checks while still being small on the wire.
+    fn nested_array(depth: usize) -> Value {
+        let mut v = json!(1);
+        for _ in 0..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    }
+
+    /// Pinned at the exact boundary rather than "comfortably past it," matching
+    /// `filter.rs`'s own boundary-test style: nesting of precisely `MAX_DEPTH` must
+    /// still be walked successfully, and precisely `MAX_DEPTH + 1` must be rejected.
+    #[test]
+    fn find_bulk_id_refs_accepts_data_nested_exactly_at_max_depth() {
+        let data = nested_array(MAX_DEPTH);
+        let mut out = HashSet::new();
+        assert!(find_bulk_id_refs(&data, &mut out, 0).is_ok());
+    }
+
+    #[test]
+    fn find_bulk_id_refs_rejects_data_nested_one_past_max_depth() {
+        let data = nested_array(MAX_DEPTH + 1);
+        let mut out = HashSet::new();
+        assert_eq!(
+            find_bulk_id_refs(&data, &mut out, 0),
+            Err(BulkError::TooDeep)
+        );
+    }
+
+    /// `order_operations` is the actual attacker-reachable entry point -- confirms the
+    /// depth guard is actually wired in, not just correct in isolation.
+    #[test]
+    fn order_operations_rejects_a_deeply_nested_operation_payload() {
+        let ops = vec![post("a", "/Users", nested_array(MAX_DEPTH + 1))];
+        assert_eq!(order_operations(&ops), Err(BulkError::TooDeep));
+    }
+
+    #[test]
+    fn resolver_substitute_accepts_data_nested_exactly_at_max_depth() {
+        let resolver = BulkIdResolver::default();
+        let data = nested_array(MAX_DEPTH);
+        assert!(resolver.substitute(&data).is_ok());
+    }
+
+    #[test]
+    fn resolver_substitute_rejects_data_nested_one_past_max_depth() {
+        let resolver = BulkIdResolver::default();
+        let data = nested_array(MAX_DEPTH + 1);
+        assert_eq!(resolver.substitute(&data), Err(BulkError::TooDeep));
     }
 }

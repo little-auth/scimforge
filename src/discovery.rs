@@ -2,6 +2,7 @@
 //! three are server-authored capability descriptions, not client-writable resources.
 
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 
 pub const SERVICE_PROVIDER_CONFIG_SCHEMA_URI: &str =
     "urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig";
@@ -88,6 +89,54 @@ pub struct ResourceType {
     pub schema_extensions: Vec<SchemaExtension>,
 }
 
+/// Bounds AttributeDefinition's subAttributes recursion during deserialization, the
+/// same DoS class filter::MAX_DEPTH guards against for filter-expression nesting.
+/// Unlike filter's hand-rolled recursive-descent parser, AttributeDefinition's
+/// Deserialize is #[derive]d, so there's no intermediate Value tree to depth-check
+/// after the fact: the recursion happens DURING parsing.
+pub const MAX_DEPTH: usize = 32;
+
+thread_local! {
+    /// JSON deserialization is synchronous (no `.await` point inside a
+    /// `from_str`/`from_value` call), so a thread-local counter is sound even when
+    /// the surrounding request handler is async. If an async-streaming deserializer
+    /// that can suspend mid-parse across threads is ever introduced, this would need
+    /// to become a passed-through depth parameter or a task-local instead.
+    static SUB_ATTRIBUTES_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+struct SubAttributesDepthGuard;
+
+impl Drop for SubAttributesDepthGuard {
+    fn drop(&mut self) {
+        SUB_ATTRIBUTES_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
+fn deserialize_sub_attributes<'de, D>(
+    deserializer: D,
+) -> Result<Vec<AttributeDefinition>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let depth = SUB_ATTRIBUTES_DEPTH.with(|depth| {
+        let next = depth.get() + 1;
+        depth.set(next);
+        next
+    });
+    let _guard = SubAttributesDepthGuard;
+
+    if depth > MAX_DEPTH {
+        return Err(D::Error::custom(format!(
+            "subAttributes nesting exceeds the maximum depth of {MAX_DEPTH}"
+        )));
+    }
+
+    Vec::<AttributeDefinition>::deserialize(deserializer)
+}
+
 /// RFC 7643 §7 attribute definition, recursive via `subAttributes` for `type: "complex"`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttributeDefinition {
@@ -112,7 +161,8 @@ pub struct AttributeDefinition {
     #[serde(
         rename = "subAttributes",
         default,
-        skip_serializing_if = "Vec::is_empty"
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_sub_attributes"
     )]
     pub sub_attributes: Vec<AttributeDefinition>,
     #[serde(
@@ -218,6 +268,19 @@ pub fn is_case_exact(
         Some(parent) => (parent, Some(attr_name)),
         None => (attr_name, sub_attr),
     };
+    // RFC 7643 3.1's four common attributes with caseExact: true (id, externalId,
+    // meta.resourceType, meta.version) are a fixed characteristic of those common
+    // attributes, not a per-resource-schema opinion -- unlike every other attribute,
+    // where the schema is the more specific, authoritative source (checked below). A
+    // real /Schemas/User document wouldn't redeclare these (see
+    // common_attribute_case_exact's doc comment), but nothing stops a caller from
+    // feeding in a schema that does -- e.g. schema data imported from a less-trusted or
+    // federated source -- so these four are resolved before consulting the schema,
+    // rather than letting an unusual schema fold case for what RFC 7643 treats as an
+    // always-case-exact identity/version field.
+    if let Some(true) = common_attribute_case_exact(top, sub) {
+        return true;
+    }
     if let Some(schema) = schema
         && let Some(attr_def) = find_attribute(schema, top, sub)
     {
@@ -459,9 +522,39 @@ mod tests {
 
     #[test]
     fn is_case_exact_prefers_the_schema_over_the_common_attributes_table() {
-        // A schema that resolves the attribute wins over the common-attributes fallback,
-        // even for a name that collides with a common attribute -- schema is always the
-        // more specific, authoritative source when it has an opinion.
+        // A schema that resolves the attribute wins over the common-attributes fallback
+        // for an ordinary attribute name -- schema is the more specific, authoritative
+        // source when it has an opinion. Uses "userName", not a common attribute, since
+        // the four RFC-mandated-true common attributes are a fixed exception (see the
+        // next test) rather than something a schema is entitled to override.
+        let schema = SchemaResource {
+            schemas: vec![SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Override".to_string(),
+            name: None,
+            description: None,
+            attributes: vec![AttributeDefinition {
+                case_exact: true,
+                ..AttributeDefinition::simple(
+                    "userName",
+                    "string",
+                    "A schema that opts an ordinary attribute into case-exactness.",
+                    "readWrite",
+                )
+            }],
+        };
+        assert!(is_case_exact(Some(&schema), None, "userName", None));
+    }
+
+    #[test]
+    fn is_case_exact_does_not_let_a_schema_override_the_four_rfc_mandated_common_attributes() {
+        // Regression: is_case_exact() used to check the schema first for every
+        // attribute name, including id/externalId/meta.resourceType/meta.version --
+        // RFC 7643 3.1's common attributes, whose caseExact:true is a fixed
+        // characteristic, not a per-resource-schema opinion. That let a schema which
+        // (unusually, but validly per the AttributeDefinition type) redeclared one of
+        // these names with caseExact:false silently fold case for what should be an
+        // exact-match identity/version field -- e.g. externalId, commonly used as a
+        // cross-system identity join key, being matched case-insensitively.
         let schema = SchemaResource {
             schemas: vec![SCHEMA_SCHEMA_URI.to_string()],
             id: "urn:test:Override".to_string(),
@@ -477,7 +570,10 @@ mod tests {
                 )
             }],
         };
-        assert!(!is_case_exact(Some(&schema), None, "externalId", None));
+        assert!(is_case_exact(Some(&schema), None, "externalId", None));
+        assert!(is_case_exact(Some(&schema), None, "id", None));
+        assert!(is_case_exact(Some(&schema), None, "meta", Some("resourceType")));
+        assert!(is_case_exact(Some(&schema), None, "meta", Some("version")));
     }
 
     #[test]
@@ -492,5 +588,93 @@ mod tests {
             "unmodeled",
             None
         ));
+    }
+
+    fn nested_attribute_json(depth: usize) -> serde_json::Value {
+        let mut attr = serde_json::json!({
+            "name": "level",
+            "type": "complex",
+            "multiValued": false,
+            "description": "A recursively nested attribute.",
+            "required": false,
+            "caseExact": false,
+            "mutability": "readWrite",
+            "returned": "default",
+            "uniqueness": "none"
+        });
+        if depth > 0 {
+            attr["subAttributes"] = serde_json::Value::Array(vec![nested_attribute_json(depth - 1)]);
+        }
+        attr
+    }
+
+    /// Pinned at the exact boundary rather than "comfortably past it," matching
+    /// `filter.rs`'s own boundary-test convention for the identical unbounded-nesting
+    /// DoS class.
+    #[test]
+    fn accepts_sub_attributes_nested_exactly_at_max_depth() {
+        let json = nested_attribute_json(MAX_DEPTH);
+        let result: Result<AttributeDefinition, _> = serde_json::from_value(json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_sub_attributes_nested_one_past_max_depth() {
+        let json = nested_attribute_json(MAX_DEPTH + 1);
+        let result: Result<AttributeDefinition, _> = serde_json::from_value(json);
+        let err = result.expect_err("nesting one past MAX_DEPTH must be rejected");
+        assert!(
+            err.to_string().contains("subAttributes nesting exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The realistic entry point for a third-party provider's `/Schemas` response,
+    /// not just a bare `AttributeDefinition` -- proving the bound holds regardless of
+    /// where deserialization is kicked off from.
+    #[test]
+    fn rejects_deeply_nested_sub_attributes_via_schema_resource() {
+        let json = serde_json::json!({
+            "schemas": [SCHEMA_SCHEMA_URI],
+            "id": "urn:test:DeepAttack",
+            "attributes": [nested_attribute_json(MAX_DEPTH + 1)]
+        });
+        let result: Result<SchemaResource, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    /// Two independent complex attributes, each nested to exactly MAX_DEPTH, as
+    /// siblings within one SchemaResource deserialize call. If the depth counter
+    /// were wrongly cumulative across siblings instead of correctly reset by RAII
+    /// Drop between them, the second sibling would spuriously fail even though
+    /// neither individually exceeds MAX_DEPTH.
+    #[test]
+    fn sibling_attributes_each_independently_reach_max_depth_within_one_call() {
+        let json = serde_json::json!({
+            "schemas": [SCHEMA_SCHEMA_URI],
+            "id": "urn:test:Siblings",
+            "attributes": [
+                nested_attribute_json(MAX_DEPTH),
+                nested_attribute_json(MAX_DEPTH)
+            ]
+        });
+        let result: Result<SchemaResource, _> = serde_json::from_value(json);
+        assert!(result.is_ok(), "sibling nesting wrongly accumulated: {result:?}");
+    }
+
+    /// Proves the thread-local depth counter is fully restored after a rejected deep
+    /// parse (via `SubAttributesDepthGuard`'s `Drop` firing on every unwind step, not
+    /// just on success) -- otherwise a rejected attack payload on a reused thread
+    /// (e.g. a thread-pooled server) would permanently poison every later,
+    /// legitimate deserialization on that thread.
+    #[test]
+    fn depth_counter_does_not_leak_across_deserialize_calls() {
+        let too_deep = nested_attribute_json(MAX_DEPTH + 1);
+        let rejected: Result<AttributeDefinition, _> = serde_json::from_value(too_deep);
+        assert!(rejected.is_err());
+
+        let shallow = nested_attribute_json(1);
+        let accepted: Result<AttributeDefinition, _> = serde_json::from_value(shallow);
+        assert!(accepted.is_ok());
     }
 }

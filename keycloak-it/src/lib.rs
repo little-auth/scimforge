@@ -31,11 +31,28 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(bearer_token: impl Into<Arc<str>>) -> Self {
+        let bearer_token = bearer_token.into();
+        assert!(
+            !bearer_token.is_empty(),
+            "bearer_token must not be empty -- an empty token would make the literal header \
+             \"Bearer \" a valid credential, authenticating any client that sends it"
+        );
         AppState {
             store: Arc::new(Mutex::new(Store::default())),
-            bearer_token: bearer_token.into(),
+            bearer_token,
         }
     }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn require_bearer_token(
@@ -48,7 +65,7 @@ async fn require_bearer_token(
     let ok = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == expected);
+        .is_some_and(|v| constant_time_eq(v.as_bytes(), expected.as_bytes()));
     if ok {
         Ok(next.run(request).await)
     } else {

@@ -80,9 +80,26 @@ pub enum PatchError {
     /// The path targets a shape apply_patch can't resolve unambiguously against the
     /// actual JSON structure (e.g. a bracket filter against a non-array value).
     AmbiguousPath(String),
+    /// The `path` carried a full schema URN prefix (RFC 7644 §3.5.2's `attrPath = [URI
+    /// ":"] ATTRNAME`, e.g. `urn:ietf:params:scim:schemas:extension:enterprise:2.0:
+    /// User:employeeNumber`). Every mutation and mutability check in this module
+    /// resolves a path via `attr_path.attr_name` against the *top level* of the
+    /// resource object -- but an extension attribute reached through a schema-qualified
+    /// path actually lives nested under a key equal to the full schema URN, not
+    /// `resource["employeeNumber"]`. Resolving that correctly is real routing logic
+    /// this module does not implement, so a schema-qualified path is rejected outright
+    /// before any mutation happens.
+    SchemaQualifiedPath(String),
     /// [`apply_patch_with_schema`] only: the path targets an attribute whose schema
     /// mutability is `readOnly`, or `immutable` with an existing value already present.
     ImmutableOrReadOnly(String),
+    /// [`apply_patch_with_schema`] only: `attr_def.mutability` on the schema passed in
+    /// is not one of RFC 7643 §2.2's four canonical tokens (`readOnly`, `readWrite`,
+    /// `immutable`, `writeOnly`) -- a typo'd, mis-cased, or whitespace-padded value in a
+    /// hand-authored or hand-edited schema document. This is a malformed schema, not a
+    /// malformed request, but it is surfaced as a hard error rather than silently
+    /// treated as the most permissive `readWrite`.
+    InvalidSchemaMutability { attr_name: String, mutability: String },
 }
 
 impl From<FilterError> for PatchError {
@@ -102,7 +119,9 @@ impl PatchError {
             PatchError::InvalidPath(_) => ScimType::InvalidPath,
             PatchError::NoMatchingValue => ScimType::NoTarget,
             PatchError::AmbiguousPath(_) => ScimType::InvalidPath,
+            PatchError::SchemaQualifiedPath(_) => ScimType::InvalidPath,
             PatchError::ImmutableOrReadOnly(_) => ScimType::Mutability,
+            PatchError::InvalidSchemaMutability { .. } => ScimType::InvalidValue,
         }
     }
 
@@ -154,22 +173,34 @@ fn apply_patch_internal(
     operations: &[PatchOperation],
     schema: Option<&SchemaResource>,
 ) -> Result<Value, PatchError> {
+    // Snapshotted once, before any operation runs, and threaded through every
+    // mutability check below as the sole source of "does this attribute currently
+    // have a value" (RFC 7644 3.5.2's immutable add-exception). Without this, an
+    // earlier op in the *same* multi-op request could Remove an immutable value and a
+    // later op could then Add it back with different content: each op's mutability
+    // check only ever consulted the live, already-partially-mutated `working` value,
+    // so the re-add looked like a genuine first-time addition (no previous value) --
+    // completely defeating "immutable" via an ordinary two-operation PATCH body,
+    // instead of requiring a whole separate PATCH request per RFC 7644's own atomic
+    // per-request semantics.
+    let original = resource.clone();
     let mut working = resource.clone();
     for operation in operations {
-        apply_one(&mut working, operation, schema)?;
+        apply_one(&mut working, &original, operation, schema)?;
     }
     Ok(working)
 }
 
 fn apply_one(
     resource: &mut Value,
+    original: &Value,
     operation: &PatchOperation,
     schema: Option<&SchemaResource>,
 ) -> Result<(), PatchError> {
     match operation.op {
-        PatchOp::Remove => apply_remove(resource, operation, schema),
-        PatchOp::Add => apply_add_or_replace(resource, operation, false, schema),
-        PatchOp::Replace => apply_add_or_replace(resource, operation, true, schema),
+        PatchOp::Remove => apply_remove(resource, original, operation, schema),
+        PatchOp::Add => apply_add_or_replace(resource, original, operation, false, schema),
+        PatchOp::Replace => apply_add_or_replace(resource, original, operation, true, schema),
     }
 }
 
@@ -193,8 +224,12 @@ fn check_mutability(
         // not this function's job to reject what it can't classify.
         return Ok(());
     };
-    let mutability =
-        Mutability::from_rfc_str(&attr_def.mutability).unwrap_or(Mutability::ReadWrite);
+    let mutability = Mutability::from_rfc_str(&attr_def.mutability).ok_or_else(|| {
+        PatchError::InvalidSchemaMutability {
+            attr_name: attr_name.to_string(),
+            mutability: attr_def.mutability.clone(),
+        }
+    })?;
     match mutability {
         Mutability::ReadOnly => Err(PatchError::ImmutableOrReadOnly(attr_name.to_string())),
         Mutability::Immutable => {
@@ -269,8 +304,21 @@ fn effective_sub_attr(path: &filter::PatchPath) -> Option<&str> {
         .or(path.sub_attr_after_filter.as_deref())
 }
 
+/// Rejects a schema-qualified `path` (see [`PatchError::SchemaQualifiedPath`]'s doc for
+/// why) before any mutation or mutability check runs.
+fn reject_schema_qualified_path(path: &filter::PatchPath) -> Result<(), PatchError> {
+    if let Some(uri) = &path.attr_path.schema_uri {
+        return Err(PatchError::SchemaQualifiedPath(format!(
+            "{uri}:{}",
+            path.attr_path.attr_name
+        )));
+    }
+    Ok(())
+}
+
 fn apply_remove(
     resource: &mut Value,
+    original: &Value,
     operation: &PatchOperation,
     schema: Option<&SchemaResource>,
 ) -> Result<(), PatchError> {
@@ -278,13 +326,14 @@ fn apply_remove(
         return Err(PatchError::NoTarget);
     };
     let path = filter::parse_patch_path(path_str)?;
+    reject_schema_qualified_path(&path)?;
     if is_protected(&path.attr_path.attr_name) {
         return Err(PatchError::Protected(path.attr_path.attr_name.clone()));
     }
     if let Some(schema) = schema {
         check_mutability(
             schema,
-            resource,
+            original,
             &path.attr_path.attr_name,
             effective_sub_attr(&path),
             path.value_filter.as_ref(),
@@ -385,8 +434,213 @@ fn coerce_to_attribute_type(value: Value, attr_def: &discovery::AttributeDefinit
     coerced.unwrap_or(value)
 }
 
+/// Guards a single entry of a multi-valued complex attribute (e.g. `Group`'s `members`,
+/// whose `value`/`$ref`/`display` sub-attributes are `immutable` per RFC 7643 §4.2 while
+/// `members` itself is `readWrite`) against silently overwriting an existing entry's
+/// immutable/readOnly sub-attribute values. `check_mutability` called with `sub_attr:
+/// None` only validates the top-level attribute's own mutability and never consults
+/// `attr_def.sub_attributes`, so a whole-entry write sailed straight past every
+/// sub-attribute's own mutability and overwrote it verbatim.
+///
+/// Shared by every call site that can replace/append a whole entry of a multi-valued
+/// complex attribute -- a bracket-filtered `path` matching one entry, or a no-path/
+/// top-level `path` array-replace/append matching zero or more entries by `value` (see
+/// [`check_multivalued_complex_replace_mutability`]) -- so none of them can be the one
+/// call site that forgets the check.
+fn check_entry_immutable_sub_attrs(
+    attr_name: &str,
+    attr_def: &discovery::AttributeDefinition,
+    existing_entry: &Value,
+    new_entry: &Value,
+) -> Result<(), PatchError> {
+    let Some(new_obj) = new_entry.as_object() else {
+        return Ok(());
+    };
+    // Iterate the *schema's* immutable/readOnly sub-attributes, not new_entry's keys --
+    // every call site here whole-replaces the matched entry object rather than merging
+    // it, so a replacement that simply omits an immutable/readOnly sub-attribute (rather
+    // than supplying an explicit conflicting value) would otherwise sail past a
+    // keys-of-new_entry loop uncaught and silently erase that value on write.
+    for sub_def in &attr_def.sub_attributes {
+        let Some(mutability) = Mutability::from_rfc_str(&sub_def.mutability) else {
+            continue;
+        };
+        if !matches!(mutability, Mutability::Immutable | Mutability::ReadOnly) {
+            continue;
+        }
+        let existing_sub_value = existing_entry.get(&sub_def.name);
+        let has_existing_value = existing_sub_value.is_some_and(|v| !matches!(v, Value::Null));
+        if !has_existing_value {
+            continue;
+        }
+        // Every key in the attacker-supplied entry that case-insensitively matches this
+        // sub-attribute's name must agree with the existing value -- not just whichever
+        // one a `.find()` happens to pick first. JSON permits multiple keys that differ
+        // only by case to coexist in the same object (serde_json's Map, backed by a
+        // BTreeMap here since this crate doesn't enable the preserve_order feature,
+        // never merges them), and this whole-entry write copies every key verbatim into
+        // the stored resource. Picking just one case-variant to check let an attacker
+        // pair a decoy key holding a value equal to the existing one (so the check
+        // passes) with the real, canonical-case key holding a forged value (which is
+        // what a typed downstream consumer's case-sensitive serde deserialization, or
+        // any other code path that resolves the canonical key, would actually read) --
+        // completely defeating immutable/readOnly enforcement in a single PATCH op. An
+        // entry that doesn't unambiguously agree on this value across every case-variant
+        // key present is itself adversarial-shaped input, not something safe to resolve
+        // with a single arbitrary tie-break.
+        let matching_values: Vec<&Value> = new_obj
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(&sub_def.name))
+            .map(|(_, v)| v)
+            .collect();
+        let all_candidates_agree = !matching_values.is_empty()
+            && matching_values
+                .iter()
+                .all(|v| Some(*v) == existing_sub_value);
+        if !all_candidates_agree {
+            return Err(PatchError::ImmutableOrReadOnly(format!(
+                "{attr_name}[].{}",
+                sub_def.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `attr_def`'s `value` sub-attribute is declared `caseExact` (RFC 7643 §2.2's
+/// default is `false`). Shared by every place in this file that must correlate an entry
+/// of a multi-valued complex attribute to its counterpart in a different array snapshot
+/// by their `value` sub-attribute -- this crate's own shipped schemas (e.g. Group.
+/// members[].value) leave it at the default, so an exact case-sensitive comparison would
+/// treat a case-varied `value` (e.g. "U-1" vs stored "u-1") as an unrelated entry.
+fn value_sub_attr_is_case_exact(attr_def: &discovery::AttributeDefinition) -> bool {
+    attr_def
+        .sub_attributes
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case("value"))
+        .is_some_and(|s| s.case_exact)
+}
+
+/// Finds the entry in `entries` whose `value` sub-attribute matches `key`, per
+/// `attr_def`'s declared `caseExact` for that sub-attribute (see
+/// [`value_sub_attr_is_case_exact`]) when both sides are strings, or exact `Value`
+/// equality otherwise. Centralizes this file's one identity convention for
+/// multi-valued complex attribute entries so every caller correlates entries the same
+/// way, rather than each re-implementing its own match.
+///
+/// `key` is the raw `Value`, not a pre-extracted `&str`: an earlier version of this
+/// function only matched when BOTH sides' `value` sub-attribute were JSON strings
+/// (`.and_then(Value::as_str)`), so a `value` written as a number, bool, or `null` --
+/// this crate never validates the sub-attribute's declared `type` for a whole-entry
+/// array write, unlike scalar attributes via `coerce_to_attribute_type` -- could never
+/// be correlated to itself again, on this or any future request. Since correlation
+/// failure means "treat as a genuine new entry, no immutability check runs at all" (RFC
+/// 7644 3.5.2's add-exception), that silently and *permanently* exempted such an entry
+/// from all immutable/readOnly protection: an attacker could plant a
+/// `{"value": 42, ...}` entry once, then freely rewrite its other sub-attributes
+/// forever, since `42` (a `Value::Number`) never matched via `.as_str()` on either side.
+/// Comparing the raw `Value` directly closes this for every JSON type uniformly.
+fn find_entry_by_value<'a>(
+    entries: &'a [Value],
+    attr_def: &discovery::AttributeDefinition,
+    key: &Value,
+) -> Option<&'a Value> {
+    let case_exact = value_sub_attr_is_case_exact(attr_def);
+    entries.iter().find(|e| {
+        let Some(existing_key) = e.get("value") else {
+            return false;
+        };
+        match (existing_key, key) {
+            (Value::String(a), Value::String(b)) => {
+                if case_exact {
+                    a == b
+                } else {
+                    a.eq_ignore_ascii_case(b)
+                }
+            }
+            (a, b) => a == b,
+        }
+    })
+}
+
+/// Guards a whole-attribute replace/add of a complex attribute (single-valued or
+/// multi-valued) against silently overwriting an existing value's immutable/readOnly
+/// sub-attribute values (see [`check_entry_immutable_sub_attrs`] for why this check
+/// exists at all).
+///
+/// Scoped to only the case that matters: `attr_def.sub_attributes` non-empty (a complex
+/// attribute). Scalar/simple attributes return `Ok` immediately.
+///
+/// A single-valued complex attribute (e.g. `manager`) has exactly one existing value to
+/// check the new one against -- there's no array to correlate entries within, and no
+/// [`find_entry_by_value`] lookup by `value` sub-attribute makes sense (a bare JSON
+/// object has no per-entry identity to match on). Checking `attr_def.multi_valued`
+/// rather than merely whether `existing` happens to already be an array matters: an
+/// absent-or-null existing value for a multi-valued attribute must still go through the
+/// array-correlation branch below (there's simply nothing to match, so every new entry
+/// is a genuine addition), not be misrouted into the single-valued branch.
+///
+/// For a multi-valued attribute, an existing entry is matched to a new one by their
+/// `value` sub-attribute (see [`find_entry_by_value`]). A new entry with no matching
+/// existing entry is a genuine addition, covered by RFC 7644 §3.5.2's add-exception, not
+/// this check.
+fn check_multivalued_complex_replace_mutability(
+    attr_name: &str,
+    attr_def: &discovery::AttributeDefinition,
+    existing: Option<&Value>,
+    new_value: &Value,
+) -> Result<(), PatchError> {
+    if attr_def.sub_attributes.is_empty() {
+        return Ok(());
+    }
+    if !attr_def.multi_valued {
+        // Single-valued complex attribute: check_entry_immutable_sub_attrs already
+        // handles "no existing value" (has_existing_value is false per sub-attribute)
+        // and "new_value isn't an object" (returns Ok) correctly on its own, so this
+        // branch can call it unconditionally rather than needing its own early-outs.
+        let existing_entry = existing.unwrap_or(&Value::Null);
+        return check_entry_immutable_sub_attrs(attr_name, attr_def, existing_entry, new_value);
+    }
+    // Mirrors apply_add_or_replace's own handling of a merged/appended value
+    // (Value::Array(items) => append each item, single => push it as one new entry): a
+    // bare (non-array) object is a valid single-entry Add there, so it must go through
+    // the same immutable-collision check as a one-element array, not silently bypass it
+    // via `new_value.as_array()` returning None.
+    let new_entries: Vec<&Value> = match new_value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    let existing_entries = existing.and_then(Value::as_array);
+
+    for new_entry in new_entries {
+        let Some(new_obj) = new_entry.as_object() else {
+            continue;
+        };
+        // The correlation key is resolved case-insensitively, matching every other
+        // place this module resolves an attribute/sub-attribute name (RFC 7643 2.2:
+        // names are case-insensitive) -- an exact-case-only `new_obj.get("value")`
+        // let an attacker spell the key as e.g. "Value", missing this lookup entirely
+        // and skipping check_entry_immutable_sub_attrs for that entry altogether,
+        // silently forging any of its immutable/readOnly sub-attributes (display,
+        // $ref, type) unchecked. Every case-variant "value"-named key present is
+        // tried against find_entry_by_value: if ANY of them correlates to an existing
+        // entry, the immutability check runs against that baseline.
+        let Some(existing_entry) = existing_entries.and_then(|entries| {
+            new_obj
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("value"))
+                .find_map(|(_, new_key)| find_entry_by_value(entries, attr_def, new_key))
+        }) else {
+            continue;
+        };
+        check_entry_immutable_sub_attrs(attr_name, attr_def, existing_entry, new_entry)?;
+    }
+    Ok(())
+}
+
 fn apply_add_or_replace(
     resource: &mut Value,
+    original: &Value,
     operation: &PatchOperation,
     is_replace: bool,
     schema: Option<&SchemaResource>,
@@ -406,12 +660,20 @@ fn apply_add_or_replace(
                 "no-path add/replace requires an object value".to_string(),
             ));
         };
-        for key in incoming.keys() {
+        for (key, new_val) in incoming {
             if is_protected(key) {
                 return Err(PatchError::Protected(key.clone()));
             }
             if let Some(schema) = schema {
-                check_mutability(schema, resource, key, None, None, op_kind)?;
+                check_mutability(schema, original, key, None, None, op_kind)?;
+                if let Some(attr_def) = discovery::find_attribute(schema, key, None) {
+                    check_multivalued_complex_replace_mutability(
+                        key,
+                        attr_def,
+                        original.get(key),
+                        new_val,
+                    )?;
+                }
             }
         }
         let root = resource.as_object_mut().ok_or_else(|| {
@@ -424,13 +686,14 @@ fn apply_add_or_replace(
     };
 
     let path = filter::parse_patch_path(path_str)?;
+    reject_schema_qualified_path(&path)?;
     if is_protected(&path.attr_path.attr_name) {
         return Err(PatchError::Protected(path.attr_path.attr_name.clone()));
     }
     if let Some(schema) = schema {
         check_mutability(
             schema,
-            resource,
+            original,
             &path.attr_path.attr_name,
             effective_sub_attr(&path),
             path.value_filter.as_ref(),
@@ -462,28 +725,43 @@ fn apply_add_or_replace(
             Ok(())
         }
         (None, None) => {
-            let value = match schema
-                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None))
-            {
+            let attr_def = schema
+                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None));
+            let value = match attr_def {
                 Some(attr_def) => coerce_to_attribute_type(value, attr_def),
                 None => value,
             };
-            match root.get_mut(&path.attr_path.attr_name) {
-                Some(existing @ Value::Array(_)) if !is_replace => {
-                    // add onto a multi-valued attribute appends rather than overwriting.
-                    let arr = existing.as_array_mut().expect("matched Value::Array");
-                    match value {
-                        Value::Array(mut new_items) => arr.append(&mut new_items),
-                        single => arr.push(single),
-                    }
+            // Checked once, ahead of both the append and whole-replace branches below --
+            // both can silently overwrite/duplicate an existing entry's immutable/readOnly
+            // sub-attribute values (RFC 7644 3.5.2's add-exception only excuses a genuine
+            // new entry, not one whose `value` collides with an entry that already exists).
+            if let Some(attr_def) = attr_def {
+                check_multivalued_complex_replace_mutability(
+                    &path.attr_path.attr_name,
+                    attr_def,
+                    original.get(&path.attr_path.attr_name),
+                    &value,
+                )?;
+            }
+            let appends_onto_existing_array = !is_replace
+                && matches!(root.get(&path.attr_path.attr_name), Some(Value::Array(_)));
+            if appends_onto_existing_array {
+                let arr = root
+                    .get_mut(&path.attr_path.attr_name)
+                    .and_then(Value::as_array_mut)
+                    .expect("matched Value::Array above");
+                match value {
+                    Value::Array(mut new_items) => arr.append(&mut new_items),
+                    single => arr.push(single),
                 }
-                _ => {
-                    root.insert(path.attr_path.attr_name.clone(), value);
-                }
+            } else {
+                root.insert(path.attr_path.attr_name.clone(), value);
             }
             Ok(())
         }
         (_, Some(value_filter)) => {
+            let attr_def = schema
+                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None));
             let array = root
                 .get_mut(&path.attr_path.attr_name)
                 .and_then(Value::as_array_mut)
@@ -508,6 +786,36 @@ fn apply_add_or_replace(
                             obj.insert(sub.clone(), coerced);
                         }
                     } else {
+                        if let Some(attr_def) = attr_def {
+                            // Consult the pre-request snapshot's matching entry, not the
+                            // live (possibly already mutated by an earlier op in this
+                            // same request) one -- for consistency with every other
+                            // mutability check in this function, all of which consult
+                            // `original` for exactly this reason. Correlated by identity
+                            // (this entry's own `value`, via find_entry_by_value), NOT
+                            // by re-running `value_filter` against `original` -- a
+                            // non-unique filter (e.g. `type eq "User"`) can match more
+                            // than one live entry in this same loop, and re-running the
+                            // filter would return the *same first* original match for
+                            // every one of them, validating every entry after the first
+                            // against an unrelated entry's baseline. Falls back to the
+                            // live `entry` only if no corresponding entry exists in the
+                            // snapshot at all (e.g. this entry was added earlier in the
+                            // same request), matching the add-exception's "no previous
+                            // value" case.
+                            let original_match = entry.get("value").and_then(|key| {
+                                original
+                                    .get(&path.attr_path.attr_name)
+                                    .and_then(Value::as_array)
+                                    .and_then(|arr| find_entry_by_value(arr, attr_def, key))
+                            });
+                            check_entry_immutable_sub_attrs(
+                                &path.attr_path.attr_name,
+                                attr_def,
+                                original_match.unwrap_or(entry),
+                                &value,
+                            )?;
+                        }
                         *entry = value.clone();
                     }
                 }
@@ -880,6 +1188,50 @@ mod tests {
     }
 
     #[test]
+    fn schema_rejects_replace_targeting_the_groups_type_sub_attribute() {
+        // Regression: groups[].type used to be unmodeled in user_schema()'s sub_attributes,
+        // so find_attribute returned None and check_mutability's unmodeled-attribute
+        // fallback silently allowed the write despite groups being readOnly.
+        let mut resource = user_with_emails();
+        resource["groups"] = json!([{"value": "g-1", "display": "Admins", "type": "direct"}]);
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"groups[value eq "g-1"].type"#),
+                Some(json!("indirect")),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn schema_rejects_replace_targeting_the_groups_ref_sub_attribute() {
+        // Same class of gap as the groups.type regression above: groups[].$ref was
+        // unmodeled in user_schema()'s sub_attributes, so it fell through
+        // check_mutability's unmodeled-attribute fallback despite groups being readOnly.
+        let mut resource = user_with_emails();
+        resource["groups"] = json!([{
+            "value": "g-1",
+            "display": "Admins",
+            "$ref": "https://example.com/v2/Groups/g-1",
+        }]);
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"groups[value eq "g-1"].$ref"#),
+                Some(json!("https://example.com/v2/Groups/evil")),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
     fn schema_allows_replace_on_readwrite_attributes_same_as_the_unscoped_check() {
         let resource = user_with_emails();
         let result = apply_patch_with_schema(
@@ -928,6 +1280,157 @@ mod tests {
                 PatchOp::Replace,
                 Some(r#"members[value eq "u-1"].display"#),
                 Some(json!("Alicia")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("members".to_string()));
+    }
+
+    fn merged_user_and_enterprise_schema() -> SchemaResource {
+        let mut schema = crate::user::user_schema();
+        schema
+            .attributes
+            .extend(crate::user::enterprise_user_schema().attributes);
+        schema
+    }
+
+    fn user_with_manager() -> Value {
+        json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "id": "u-1",
+            "userName": "bjensen",
+            "manager": {
+                "value": "u-boss",
+                "$ref": "https://example.com/v2/Users/u-boss",
+                "displayName": "Real Boss"
+            }
+        })
+    }
+
+    #[test]
+    fn schema_rejects_a_whole_attribute_replace_that_forges_managers_readonly_displayname() {
+        // Regression: check_multivalued_complex_replace_mutability's correlation logic
+        // assumed a multi-valued attribute (existing.as_array()), so a single-valued
+        // complex attribute's existing object was silently treated as "no existing
+        // entries" and check_entry_immutable_sub_attrs never ran -- letting a
+        // whole-attribute replace overwrite manager.displayName (readOnly) despite the
+        // equivalent dotted-path replace (manager.displayName) correctly rejecting it.
+        let resource = user_with_manager();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("manager"),
+                Some(json!({
+                    "value": "u-boss",
+                    "$ref": "https://example.com/v2/Users/u-boss",
+                    "displayName": "FORGED BOSS"
+                })),
+            )],
+            &merged_user_and_enterprise_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn schema_rejects_a_no_path_replace_that_forges_managers_readonly_displayname() {
+        // Same gap as above, reached via the no-path merge form instead of an explicit
+        // "manager" path.
+        let resource = user_with_manager();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "manager": {
+                        "value": "u-boss",
+                        "$ref": "https://example.com/v2/Users/u-boss",
+                        "displayName": "FORGED BOSS 2"
+                    }
+                })),
+            )],
+            &merged_user_and_enterprise_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn schema_allows_replacing_managers_readwrite_value_and_ref_without_touching_displayname() {
+        // A legitimate manager reassignment (value/$ref are readWrite) must still work --
+        // the fix above must not over-reject a replace that leaves displayName untouched
+        // in the request but equal to the existing stored value.
+        let resource = user_with_manager();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("manager"),
+                Some(json!({
+                    "value": "u-new-boss",
+                    "$ref": "https://example.com/v2/Users/u-new-boss",
+                    "displayName": "Real Boss"
+                })),
+            )],
+            &merged_user_and_enterprise_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["manager"]["value"], "u-new-boss");
+    }
+
+    #[test]
+    fn schema_rejects_a_whole_array_replace_correlating_via_a_decoy_cased_value_key() {
+        // Regression: check_multivalued_complex_replace_mutability correlated a
+        // replacement entry to its existing counterpart via an exact-case-only
+        // `new_obj.get("value")`. SCIM attribute names are case-insensitive (RFC 7643
+        // 2.2), and every other lookup in this file already accounts for that -- but
+        // this one didn't: spelling the correlation key "Value" instead of "value"
+        // missed the lookup entirely, so the entry was silently treated as a brand-new
+        // addition and check_entry_immutable_sub_attrs never ran for it, letting an
+        // attacker forge any immutable sub-attribute (here, display) of an existing
+        // entry just by capitalizing the one key this correlation step read.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": "u-1", "type": "User", "display": "Alice"}]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("members"),
+                Some(json!([{"Value": "u-1", "type": "User", "display": "MALLORY"}])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PatchError::ImmutableOrReadOnly("members[].display".to_string())
+        );
+    }
+
+    #[test]
+    fn schema_rejects_replace_targeting_the_members_type_sub_attribute() {
+        // Regression: members[].type was unmodeled in group_schema()'s sub_attributes,
+        // so find_attribute returned None and check_mutability's unmodeled-attribute
+        // fallback silently allowed flipping an existing member's type after creation.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": "u-1", "type": "User", "display": "Alice"}]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"].type"#),
+                Some(json!("Group")),
             )],
             &crate::group::group_schema(),
         )
@@ -1610,5 +2113,668 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["members"][0]["primary"], json!(true));
+    }
+
+    #[test]
+    fn rejects_schema_qualified_path_on_replace_rather_than_writing_a_bogus_top_level_key() {
+        let resource = user_with_emails();
+        let err = apply_patch(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(
+                    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
+                ),
+                Some(json!("12345")),
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::SchemaQualifiedPath(_)));
+        assert!(resource
+            .get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber")
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_schema_qualified_path_on_remove() {
+        let resource = user_with_emails();
+        let err = apply_patch(
+            &resource,
+            &[op(
+                PatchOp::Remove,
+                Some("urn:ietf:params:scim:schemas:core:2.0:User:userName"),
+                None,
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::SchemaQualifiedPath(_)));
+    }
+
+    #[test]
+    fn rejects_schema_qualified_path_with_schema_present_too() {
+        let resource = user_with_emails();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("urn:ietf:params:scim:schemas:core:2.0:User:active"),
+                Some(json!(false)),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::SchemaQualifiedPath(_)));
+    }
+
+    #[test]
+    fn schema_qualified_path_error_maps_to_invalid_path_scim_type() {
+        assert_eq!(
+            PatchError::SchemaQualifiedPath("x".to_string()).scim_type(),
+            ScimType::InvalidPath
+        );
+    }
+
+    #[test]
+    fn unqualified_path_to_a_core_attribute_is_unaffected_by_the_new_rejection() {
+        let resource = user_with_emails();
+        let result = apply_patch(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!(false)))],
+        )
+        .unwrap();
+        assert_eq!(result["active"], false);
+    }
+
+    #[test]
+    fn schema_rejects_a_malformed_mutability_string_instead_of_treating_it_as_readwrite() {
+        let schema = crate::discovery::SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Typo".to_string(),
+            name: Some("Typo".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition::simple(
+                "secretField",
+                "string",
+                "Should be locked down, but the schema has a typo.",
+                "immutible",
+            )],
+        };
+        let resource = json!({"schemas": ["urn:test:Typo"], "secretField": "original"});
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("secretField"),
+                Some(json!("attacker-controlled")),
+            )],
+            &schema,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            PatchError::InvalidSchemaMutability { .. }
+        ));
+        if let PatchError::InvalidSchemaMutability {
+            attr_name,
+            mutability,
+        } = err
+        {
+            assert_eq!(attr_name, "secretField");
+            assert_eq!(mutability, "immutible");
+        }
+    }
+
+    #[test]
+    fn schema_accepts_the_four_exact_rfc_mutability_tokens() {
+        for token in ["readOnly", "readWrite", "immutable", "writeOnly"] {
+            let schema = crate::discovery::SchemaResource {
+                schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+                id: "urn:test:Tokens".to_string(),
+                name: Some("Tokens".to_string()),
+                description: None,
+                attributes: vec![crate::discovery::AttributeDefinition::simple(
+                    "field", "string", "test", token,
+                )],
+            };
+            let resource = json!({"schemas": ["urn:test:Tokens"], "field": "original"});
+            let result = apply_patch_with_schema(
+                &resource,
+                &[op(PatchOp::Replace, Some("field"), Some(json!("new")))],
+                &schema,
+            );
+            if let Err(err) = result {
+                assert!(
+                    !matches!(err, PatchError::InvalidSchemaMutability { .. }),
+                    "token {token:?} should parse cleanly, got {err:?}"
+                );
+            }
+        }
+    }
+
+    // --- Whole-array replace of a multi-valued complex attribute must still enforce
+    // per-sub-attribute immutability (no-path merge and explicit top-level-path forms) ---
+
+    #[test]
+    fn no_path_replace_rejects_a_whole_members_array_that_changes_an_immutable_sub_attribute() {
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "members": [
+                        {"value": "u-1", "type": "User", "display": "NOT-ALICE"},
+                        {"value": "u-2", "type": "User"}
+                    ]
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn no_path_replace_allows_a_whole_members_array_that_only_adds_a_new_member() {
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "members": [
+                        {"value": "u-1", "type": "User", "display": "Alice"},
+                        {"value": "u-2", "type": "User"},
+                        {"value": "u-3", "type": "User", "display": "Carol"}
+                    ]
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        let members = result["members"].as_array().unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[2]["value"], "u-3");
+    }
+
+    #[test]
+    fn no_path_replace_allows_resubmitting_identical_sub_attribute_values() {
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "members": [
+                        {"value": "u-1", "type": "User", "display": "Alice"},
+                        {"value": "u-2", "type": "User"}
+                    ]
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn no_path_replace_rejects_a_whole_members_array_that_silently_omits_an_immutable_sub_attribute() {
+        // Regression: check_entry_immutable_sub_attrs used to only inspect sub-attribute
+        // keys present in the *new* entry, never the schema's own list of
+        // immutable/readOnly sub-attributes -- so a replacement entry that simply
+        // omitted "display" (rather than supplying a conflicting value for it) was never
+        // compared against anything and sailed through, silently erasing the immutable
+        // value on write since every call site here whole-replaces the matched entry.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "members": [
+                        {"value": "u-1", "type": "User"},
+                        {"value": "u-2", "type": "User"}
+                    ]
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn explicit_top_level_path_replace_rejects_a_members_array_that_silently_omits_an_immutable_sub_attribute() {
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("members"),
+                Some(json!([
+                    {"value": "u-1", "type": "User"},
+                    {"value": "u-2", "type": "User"}
+                ])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn bracket_filter_replace_with_no_trailing_sub_attr_rejects_silently_omitting_an_immutable_sub_attribute() {
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"]"#),
+                Some(json!({"value": "u-1", "type": "User"})),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn explicit_top_level_path_replace_rejects_changing_an_existing_members_immutable_value() {
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("members"),
+                Some(json!([
+                    {"value": "u-1", "type": "User", "display": "Mallory"},
+                    {"value": "u-2", "type": "User"}
+                ])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn explicit_top_level_path_add_onto_an_existing_array_still_only_appends() {
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some("members"),
+                Some(json!([{"value": "u-3", "type": "User", "display": "Carol"}])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        let members = result["members"].as_array().unwrap();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0]["display"], "Alice");
+    }
+
+    #[test]
+    fn explicit_top_level_path_add_rejects_a_duplicate_value_with_forged_immutable_fields() {
+        // Regression: an Add (not Replace) onto an existing array took the "append"
+        // branch unconditionally and never ran check_multivalued_complex_replace_mutability
+        // -- unlike the sibling whole-replace branch. A client could "add" a new members
+        // entry whose `value` collides with an existing member's, carrying attacker-chosen
+        // immutable sub-attributes (display/$ref/type), and it sailed straight through.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some("members"),
+                Some(json!([
+                    {"value": "u-1", "type": "User", "display": "MALLORY", "$ref": "https://evil.example/Users/attacker"}
+                ])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn explicit_top_level_path_add_rejects_a_bare_object_duplicate_value_with_forged_immutable_fields() {
+        // Regression: check_multivalued_complex_replace_mutability bailed out silently
+        // (`new_value.as_array()` returning None) for a bare (non-array) object value,
+        // even though apply_add_or_replace's own append logic explicitly accepts a bare
+        // object as a valid single-entry Add (`single => arr.push(single)`). Sending
+        // the same forged-fields payload as this suite's array-wrapped sibling test,
+        // but without the array brackets, used to skip the immutable check entirely.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some("members"),
+                Some(json!(
+                    {"value": "u-1", "type": "User", "display": "MALLORY", "$ref": "https://evil.example/Users/attacker"}
+                )),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn explicit_top_level_path_replace_rejects_a_case_varied_value_with_forged_immutable_fields() {
+        // Regression: matching a new entry to its existing counterpart by the `value`
+        // sub-attribute used exact case-sensitive `==`, never consulting the schema's
+        // declared caseExact for that sub-attribute (RFC 7643 2.2's default is false,
+        // and Group.members[].value is left at that default). A case-varied `value`
+        // (e.g. "U-1" for stored "u-1") was treated as an unrelated new entry rather
+        // than the same member, so the immutable-field check never ran for it.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("members"),
+                Some(json!([
+                    {"value": "U-1", "type": "User", "display": "MALLORY"},
+                    {"value": "u-2", "type": "User"}
+                ])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    #[test]
+    fn a_remove_then_readd_within_one_patch_request_cannot_smuggle_forged_immutable_fields() {
+        // Regression, the deepest one found this session: every mutability check's
+        // "does this attribute currently have a value" question was answered by
+        // consulting the *live, already-partially-mutated* working resource threaded
+        // through apply_patch_internal's op loop -- not the resource as it stood
+        // before this PATCH request began. That let an earlier op in the SAME
+        // multi-op request Remove an immutable member entry, then a later op in the
+        // same request Add it back with forged content: since the entry no longer
+        // existed in the (live, already-mutated) state the check consulted, it looked
+        // exactly like a genuine first-time addition, RFC 7644 3.5.2's own stated
+        // exception -- completely defeating "immutable" via an ordinary two-operation
+        // PATCH body, not even a whole separate request.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[
+                op(
+                    PatchOp::Remove,
+                    Some(r#"members[value eq "u-1"]"#),
+                    None,
+                ),
+                op(
+                    PatchOp::Add,
+                    Some("members"),
+                    Some(json!([{"value": "u-1", "type": "User", "display": "MALLORY"}])),
+                ),
+            ],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        // The original resource passed in must remain completely untouched: apply_patch
+        // never mutates its input, so the caller's own copy is unaffected either way,
+        // but this also confirms the rejection happened before either op's effects
+        // could be observed by re-inspecting the (unrelated, still-original) input.
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn a_genuine_no_path_readd_after_removal_in_a_separate_request_still_succeeds() {
+        // Confirms the fix is scoped correctly: RFC 7644 3.5.2's add-exception must
+        // still work across *separate* PATCH requests/calls -- only a resurrection
+        // within the *same* request's op sequence is rejected. Two independent
+        // apply_patch_with_schema calls, feeding the first's output into the second.
+        let resource = group_with_two_members();
+        let after_remove = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Remove, Some(r#"members[value eq "u-1"]"#), None)],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        let after_readd = apply_patch_with_schema(
+            &after_remove,
+            &[op(
+                PatchOp::Add,
+                Some("members"),
+                Some(json!([{"value": "u-1", "type": "User", "display": "Bob"}])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        let members = after_readd["members"].as_array().unwrap();
+        assert!(
+            members
+                .iter()
+                .any(|m| m["value"] == "u-1" && m["display"] == "Bob")
+        );
+    }
+
+    #[test]
+    fn no_path_replace_rejects_a_decoy_cased_key_hiding_a_forged_immutable_value() {
+        // Regression, the most severe found this session: check_entry_immutable_sub_attrs
+        // resolved the attacker-supplied replacement value with `.find()` over the new
+        // entry's own keys matched case-insensitively -- returning only the FIRST
+        // case-insensitive match. serde_json::Map (BTreeMap-backed here, no
+        // preserve_order feature) never merges keys that differ only by case, and JSON
+        // permits both to coexist in the same object. An attacker could pair a decoy
+        // "Display" holding a value equal to the existing one (so the immutability check
+        // passes) with the real, canonical-case "display" holding a forged value --
+        // since the whole entry is written verbatim, both keys land in the stored
+        // resource, and any downstream consumer resolving the canonical key (a typed
+        // struct's case-sensitive serde deserialization, for one) reads the forged value.
+        // This defeated immutable/readOnly enforcement entirely, in a single PATCH op.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "members": [
+                        {"value": "u-1", "type": "User", "Display": "Alice", "display": "MALLORY"},
+                        {"value": "u-2", "type": "User"}
+                    ]
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn no_path_replace_allows_a_genuinely_duplicated_case_variant_key_with_agreeing_values() {
+        // The fix must not reject a harmless case: multiple case-variant keys are
+        // present but all of them (and the existing value) genuinely agree -- not an
+        // attempted change, just redundant duplication.
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "members": [
+                        {"value": "u-1", "type": "User", "Display": "Alice", "display": "Alice"},
+                        {"value": "u-2", "type": "User"}
+                    ]
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn bracket_filter_replace_rejects_a_decoy_cased_key_hiding_a_forged_immutable_value() {
+        // Same regression as the no-path case above, reproduced via the bracket-filter
+        // whole-entry-replace call site (a distinct code path calling the same helper).
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"]"#),
+                Some(json!({
+                    "value": "u-1",
+                    "type": "User",
+                    "Display": "Alice",
+                    "display": "MALLORY"
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn bracket_filter_replace_matching_multiple_entries_checks_each_against_its_own_baseline() {
+        // Regression, the deepest found this session: when a value-filter matches more
+        // than one live array entry (e.g. `type eq "User"`), the immutable-check's
+        // baseline for "the matching entry in the original snapshot" was found by
+        // *re-running the same filter* against `original` -- which returns the SAME
+        // first match every loop iteration, regardless of which live entry is
+        // currently being validated. Here the filter matches both u-1 (no `display`
+        // set) and u-2 (`display: "Alice"`). The attacker's single replacement payload
+        // trivially passes when checked against u-1's baseline (no prior value to
+        // conflict with), so the old code -- always consulting u-1's baseline -- let
+        // that same payload silently overwrite u-2's real, immutable `display` too,
+        // with zero validation against u-2's own true prior value. Correlating each
+        // live entry to its own counterpart by identity (its `value`) instead of by
+        // re-filtering closes this: u-2 must now be checked against its own baseline.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [
+                {"value": "u-1", "type": "User"},
+                {"value": "u-2", "type": "User", "display": "Alice"}
+            ]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[type eq "User"]"#),
+                Some(json!({"value": "u-1", "type": "User", "display": "MALLORY"})),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][1]["display"], "Alice");
+    }
+
+    #[test]
+    fn explicit_top_level_path_replace_rejects_forging_an_entry_whose_value_is_not_a_string() {
+        // Regression: find_entry_by_value used to correlate entries by
+        // `.get("value").and_then(Value::as_str)` on BOTH sides -- this crate never
+        // validates a multi-valued complex attribute's `value` sub-attribute type on a
+        // whole-entry write (unlike scalar attributes via coerce_to_attribute_type), so
+        // a `value` written as a JSON number (or bool/null) could never be correlated
+        // to itself again, on this or any FUTURE request: correlation failure means
+        // "genuine new entry, no immutability check runs at all" (RFC 7644 3.5.2's
+        // add-exception), silently and permanently exempting that entry from all
+        // immutable/readOnly protection. Comparing the raw Value (not just strings)
+        // closes this for every JSON type uniformly.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": 42, "type": "User", "display": "Alice"}]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("members"),
+                Some(json!([{"value": 42, "type": "User", "display": "MALLORY"}])),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn bracket_filter_replace_with_no_trailing_sub_attr_rejects_changing_an_immutable_value() {
+        // Regression: a bracket-filtered path matching a whole entry with no trailing
+        // sub-attribute (e.g. `members[value eq "u-1"]`, as opposed to
+        // `members[value eq "u-1"].display`) replaced the matched entry wholesale via
+        // `*entry = value.clone()`, never consulting check_entry_immutable_sub_attrs --
+        // the same op-type check_multivalued_complex_replace_mutability was written to
+        // enforce for the no-path/top-level-path forms, just a call site that got missed.
+        let resource = group_with_two_members();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"]"#),
+                Some(json!({
+                    "value": "u-1",
+                    "type": "User",
+                    "display": "MALLORY",
+                    "$ref": "https://evil.example/Users/attacker"
+                })),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+        assert_eq!(resource["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn bracket_filter_replace_with_no_trailing_sub_attr_still_allows_a_matching_display_name() {
+        // The fix must not reject a legitimate resubmission of the same immutable values
+        // (RFC 7644's "no actual change" case), only a genuine attempted change.
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"]"#),
+                Some(json!({"value": "u-1", "type": "User", "display": "Alice"})),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][0]["display"], "Alice");
+    }
+
+    #[test]
+    fn scalar_attributes_are_unaffected_by_the_new_multivalued_check() {
+        let resource = group_with_two_members();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"displayName": "New Name"})),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["displayName"], "New Name");
     }
 }
