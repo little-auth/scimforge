@@ -146,6 +146,13 @@ pub async fn replace(
     let value = serde_json::to_value(&user).expect("User always serializes");
 
     let mut store = state.store.lock().unwrap();
+    // Re-check the user still exists under this fresh lock: the store was unlocked
+    // between the existence check above and here, so a concurrent DELETE could have
+    // removed it in the meantime. Without this check, an unconditional insert would
+    // resurrect a resource a racing client just explicitly deleted.
+    if !store.users.contains_key(&id) {
+        return Err(ApiError::NotFound(id));
+    }
     store.users.insert(id, value.clone());
     Ok(Json(value))
 }
@@ -179,17 +186,23 @@ pub async fn patch(
         meta["lastModified"] = serde_json::to_value(Utc::now()).unwrap();
     }
 
+    let user: User = serde_json::from_value(patched.clone()).map_err(|e| {
+        ApiError::InvalidBody(format!(
+            "patched resource no longer deserializes as a typed User: {e}"
+        ))
+    })?;
+    let value = serde_json::to_value(&user).expect("User always serializes");
+
     let mut store = state.store.lock().unwrap();
-    store.users.insert(id, patched.clone());
-    // Round-trip through the typed `User` so a caller of this handler can trust the
-    // stored value is still schema-shaped -- if this ever fails after a successful
-    // apply_patch_with_schema, that's a real conformance gap worth surfacing loudly
-    // rather than storing silently-untyped JSON.
-    if serde_json::from_value::<User>(patched.clone()).is_err() {
-        patched["_keycloakItWarning"] =
-            Value::String("patched resource no longer deserializes as a typed User".to_string());
+    // Re-check the user still exists under this fresh lock: the store was unlocked for
+    // the whole patch/typed-round-trip computation above, so a concurrent DELETE could
+    // have removed it in the meantime. Without this check, an unconditional insert
+    // would resurrect a resource a racing client just explicitly deleted.
+    if !store.users.contains_key(&id) {
+        return Err(ApiError::NotFound(id));
     }
-    Ok(Json(patched))
+    store.users.insert(id, value.clone());
+    Ok(Json(value))
 }
 
 pub async fn delete(

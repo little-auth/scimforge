@@ -128,9 +128,30 @@ pub async fn patch(
         meta["lastModified"] = serde_json::to_value(Utc::now()).unwrap();
     }
 
+    // Round-trip through the typed Group, same as users::patch: group_schema() only
+    // models displayName/members (plus the universal PROTECTED_TOP_LEVEL guard for
+    // id/meta/schemas in src/patch.rs), so any *other* attribute name a client PATCHes
+    // in sails straight through the merge with no rejection -- check_mutability
+    // explicitly no-ops on an attribute find_attribute can't resolve. Persisting the
+    // typed round-trip instead of the raw merged Value drops any such smuggled
+    // attribute before it can persist and be served back on every later GET/LIST.
+    let group: Group = serde_json::from_value(patched.clone()).map_err(|e| {
+        ApiError::InvalidBody(format!(
+            "patched resource no longer deserializes as a typed Group: {e}"
+        ))
+    })?;
+    let value = serde_json::to_value(&group).expect("Group always serializes");
+
     let mut store = state.store.lock().unwrap();
-    store.groups.insert(id, patched.clone());
-    Ok(Json(patched))
+    // Re-check the group still exists under this fresh lock: the store was unlocked
+    // for the whole patch/typed-round-trip computation above, so a concurrent DELETE
+    // could have removed it in the meantime. Without this check, an unconditional
+    // insert would resurrect a resource a racing client just explicitly deleted.
+    if !store.groups.contains_key(&id) {
+        return Err(ApiError::NotFound(id));
+    }
+    store.groups.insert(id, value.clone());
+    Ok(Json(value))
 }
 
 pub async fn delete(

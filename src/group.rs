@@ -86,6 +86,18 @@ pub fn group_schema() -> SchemaResource {
                         "A human-readable name for the group member.",
                         "immutable",
                     ),
+                    // "type" (canonicalValues "User"/"Group") is immutable per RFC 7643
+                    // 4.2/8.7.1, same as value/$ref/display -- without this entry the
+                    // PATCH engine's schema-driven mutability check can't see this
+                    // sub-attribute at all (find_attribute returns None, which
+                    // check_mutability treats permissively), letting a client silently
+                    // flip an existing member's type after creation.
+                    AttributeDefinition::simple(
+                        "type",
+                        "string",
+                        "A label indicating the type of resource, e.g. 'User' or 'Group'.",
+                        "immutable",
+                    ),
                 ],
                 ..AttributeDefinition::simple(
                     "members",
@@ -117,7 +129,7 @@ mod tests {
             "members itself is readWrite -- only its sub-attributes are immutable"
         );
 
-        for immutable_sub in ["value", "$ref", "display"] {
+        for immutable_sub in ["value", "$ref", "display", "type"] {
             let sub = find_attribute(&schema, "members", Some(immutable_sub))
                 .unwrap_or_else(|| panic!("members.{immutable_sub} must be resolvable"));
             assert_eq!(

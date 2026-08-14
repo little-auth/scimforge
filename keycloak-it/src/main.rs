@@ -8,6 +8,11 @@ async fn main() {
 
     let bearer_token = std::env::var("SCIM_IT_BEARER_TOKEN")
         .expect("SCIM_IT_BEARER_TOKEN must be set -- this server refuses to guess a shared secret");
+    assert!(
+        !bearer_token.is_empty(),
+        "SCIM_IT_BEARER_TOKEN must not be empty -- an empty token would make the literal \
+         header \"Bearer \" a valid credential, authenticating any client that sends it"
+    );
     let port: u16 = std::env::var("SCIM_IT_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

@@ -124,6 +124,13 @@ pub struct PatchPath {
     /// `addresses[type eq "work"].streetAddress`. Only meaningful when
     /// `value_filter` is `Some`; a bare `attrPath`'s own sub-attribute (e.g.
     /// `name.familyName`, no brackets at all) already lives on `attr_path.sub_attr`.
+    ///
+    /// `attr_path.sub_attr` and `value_filter` are never both `Some` at once:
+    /// [`parse_patch_path`] rejects the `attr.subAttr[filter]` shape (a dotted
+    /// sub-attribute *before* a bracket filter) at parse time, since RFC 7644's PATH
+    /// grammar (`PATH = attrPath / valuePath [subAttr]`) only permits a dotted
+    /// sub-attribute *after* a bracket filter. Callers may rely on this invariant
+    /// rather than reconciling both fields themselves.
     pub sub_attr_after_filter: Option<String>,
 }
 
@@ -134,6 +141,28 @@ pub fn parse_patch_path(input: &str) -> Result<PatchPath, FilterError> {
         pos: 0,
     };
     let attr_path = parser.parse_attr_path()?;
+    if attr_path.sub_attr.is_some() && matches!(parser.peek(), Some(Token::LBracket)) {
+        // RFC 7644 3.5.2's PATH grammar is `PATH = attrPath / valuePath [subAttr]` --
+        // unlike the general search-FILTER grammar (where `valuePath`'s `attrPath`
+        // production does allow a `subAttr`), a PATCH path only ever permits a dotted
+        // sub-attribute AFTER a bracket filter, never before one. `parse_attr_path`
+        // above already consumed "attr.subAttr"; seeing "[" next means the input was
+        // the illegal `attr.subAttr[filter]` shape (e.g.
+        // `members.display[value eq "u-2"]`), not the valid
+        // `attr[filter].subAttr` shape. Left unrejected, this would construct a
+        // `PatchPath` with both `attr_path.sub_attr` and `value_filter` set
+        // simultaneously -- a shape downstream code (see patch.rs's
+        // `effective_sub_attr` vs. its write paths) does not agree on, letting a
+        // mutability check approve a sub-attribute write while the actual mutation
+        // falls back to a whole-entry replace/remove. Rejecting here keeps "ambiguous
+        // paths are a hard parse error" (this module's own guarantee, see patch.rs's
+        // module doc) true by construction, rather than relying on every downstream
+        // consumer to reconcile the two fields consistently.
+        return Err(FilterError::UnexpectedToken(format!(
+            "{:?}",
+            Token::LBracket
+        )));
+    }
     let (value_filter, sub_attr_after_filter) = if matches!(parser.peek(), Some(Token::LBracket)) {
         parser.advance();
         let inner = parser.parse_val_filter(1)?;
@@ -309,6 +338,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, FilterError> {
             }
             c if c.is_ascii_alphabetic() || c == '_' || c == '$' || c == '/' => {
                 let start = i;
+                // Unconditionally consume the leading character before the continuation
+                // loop below, mirroring the number arm's `if c == '-' { i += 1; }` above.
+                // '$' (needed for the "$ref" sub-attribute name) is not itself in the
+                // continuation charset, so without this the loop would never advance past
+                // a leading '$' and the outer `while i < chars.len()` would spin forever
+                // re-matching the same character -- an unbounded-memory DoS reachable from
+                // any attacker-controlled PATCH path or filter string.
+                i += 1;
                 // ATTRNAME = ALPHA *(nameChar); nameChar = "-" / "_" / DIGIT / ALPHA.
                 // Schema URIs (urn:ietf:params:...) additionally use ':' and '/' inside
                 // the URI segment, handled below by the colon-joining pass in
@@ -384,6 +421,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The real recursive depth of an already-built `Filter` tree -- i.e. how deep
+    /// `Drop`/`Clone`/`PartialEq`'s own recursive traversal would go, the exact thing
+    /// `MAX_DEPTH` exists to bound (see the module doc). This is deliberately NOT
+    /// derived from the `depth` bookkeeping parameter threaded through the parser: that
+    /// parameter only ever reflects paren/`not`-nesting plus the current call frame's
+    /// own flat chain-link count, never the depth already reached inside an operand
+    /// built by a *different* mechanism (a sibling chain, or a nested group) -- see
+    /// `parse_or`/`parse_and`'s comment for the exact composition bug this closes.
+    fn filter_depth(f: &Filter) -> usize {
+        match f {
+            Filter::Present(_) | Filter::Compare(_, _, _) => 0,
+            Filter::Not(inner) | Filter::ValuePath(_, inner) => 1 + Self::filter_depth(inner),
+            Filter::And(a, b) | Filter::Or(a, b) => {
+                1 + Self::filter_depth(a).max(Self::filter_depth(b))
+            }
+        }
+    }
+
     /// `FILTER = attrExp / logExp / valuePath / *1"not" "(" FILTER ")"`, with RFC
     /// 7644 §3.4.2.2's explicit precedence ("not" > "and" > "or") implemented as the
     /// usual precedence-climbing grammar levels: an `or` chain of `and` chains of
@@ -396,10 +451,30 @@ impl<'a> Parser<'a> {
     fn parse_or(&mut self, depth: usize) -> Result<Filter, FilterError> {
         Self::check_depth(depth)?;
         let mut left = self.parse_and(depth)?;
+        // Each `or` link grows Filter::Or's left-leaning Box<Filter> spine by one, the
+        // same unbounded-recursion shape (stack-overflow DoS on Drop/Clone/PartialEq's
+        // recursive traversal, not just on the parser's own call stack) MAX_DEPTH exists
+        // to bound for nested grouping -- a *flat* `a pr and a pr and ... and a pr` chain
+        // is unrelated to bracket/paren nesting depth, so it must count against the same
+        // budget on its own, not inherit whatever `depth` the caller passed in once.
+        //
+        // Checking `filter_depth(&left)` (the tree's REAL depth) after every extension --
+        // rather than a synthetic link-count counter seeded from `depth` -- is what makes
+        // this sound when chains and nested groups compose: a prior fix bounded a single
+        // flat chain in isolation, but a `left` operand that arrived here already deep
+        // (built via nested `(...)`/`not(...)` groups, or via its own maximal flat
+        // sub-chain one level down) was invisible to a counter that only ever started
+        // counting from the caller's `depth`. An attacker could max out MAX_DEPTH via one
+        // mechanism, then keep stacking more `or`/`and` links on top via the other,
+        // reaching a real tree depth many multiples of MAX_DEPTH while every individual
+        // check_depth call along the way stayed within bounds. Checking the actual
+        // materialized depth closes that regardless of how it was assembled.
+        Self::check_depth(Self::filter_depth(&left))?;
         while matches!(self.peek(), Some(Token::Or)) {
             self.advance();
-            let right = self.parse_and(depth + 1)?;
+            let right = self.parse_and(depth)?;
             left = Filter::Or(Box::new(left), Box::new(right));
+            Self::check_depth(Self::filter_depth(&left))?;
         }
         Ok(left)
     }
@@ -407,10 +482,15 @@ impl<'a> Parser<'a> {
     fn parse_and(&mut self, depth: usize) -> Result<Filter, FilterError> {
         Self::check_depth(depth)?;
         let mut left = self.parse_filter_unary(depth)?;
+        // See parse_or's comment: an `and` chain grows the same unbounded Box<Filter>
+        // spine and must be bounded independently of nested-grouping depth, and the
+        // bound must be checked against the tree's real depth, not a synthetic counter.
+        Self::check_depth(Self::filter_depth(&left))?;
         while matches!(self.peek(), Some(Token::And)) {
             self.advance();
-            let right = self.parse_filter_unary(depth + 1)?;
+            let right = self.parse_filter_unary(depth)?;
             left = Filter::And(Box::new(left), Box::new(right));
+            Self::check_depth(Self::filter_depth(&left))?;
         }
         Ok(left)
     }
@@ -845,6 +925,78 @@ mod tests {
         );
     }
 
+    /// Regression: parse_and/parse_or's `while` loop passed the literal `depth + 1`
+    /// (the *caller's* depth, never reassigned) to every iteration's recursive call
+    /// instead of tracking chain length -- so check_depth never tripped for a *flat*
+    /// `a pr and a pr and ... and a pr` chain, no matter how long, since it's unrelated
+    /// to paren/bracket nesting depth. Each additional link still builds one more
+    /// Box<Filter> onto Filter::And/Or's left-leaning spine, so an unbounded chain is
+    /// an unbounded-recursion stack-overflow DoS on Drop (and Clone/PartialEq) even
+    /// though the parser itself doesn't recurse per link. Pinned at the exact boundary
+    /// like the nesting-depth tests above, not just "comfortably past it."
+    fn flat_and_chain_expr(links: usize) -> String {
+        std::iter::repeat_n("active pr", links + 1)
+            .collect::<Vec<_>>()
+            .join(" and ")
+    }
+
+    fn flat_or_chain_expr(links: usize) -> String {
+        std::iter::repeat_n("active pr", links + 1)
+            .collect::<Vec<_>>()
+            .join(" or ")
+    }
+
+    #[test]
+    fn accepts_flat_and_chain_exactly_at_max_depth() {
+        assert!(parse(&flat_and_chain_expr(MAX_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn rejects_flat_and_chain_one_past_max_depth() {
+        assert_eq!(
+            parse(&flat_and_chain_expr(MAX_DEPTH + 1)),
+            Err(FilterError::TooDeep)
+        );
+    }
+
+    #[test]
+    fn accepts_flat_or_chain_exactly_at_max_depth() {
+        assert!(parse(&flat_or_chain_expr(MAX_DEPTH)).is_ok());
+    }
+
+    #[test]
+    fn rejects_flat_or_chain_one_past_max_depth() {
+        assert_eq!(
+            parse(&flat_or_chain_expr(MAX_DEPTH + 1)),
+            Err(FilterError::TooDeep)
+        );
+    }
+
+    #[test]
+    fn rejects_an_or_link_appended_onto_an_already_max_depth_and_chain() {
+        // Regression: parse_or's chain_depth counter used to be seeded from the
+        // caller's `depth` parameter alone, blind to the real depth already reached
+        // inside `left` by a DIFFERENT mechanism (here, parse_and's own maximal flat
+        // chain, built one level down). A flat `and` chain at exactly MAX_DEPTH is
+        // itself legal (accepts_flat_and_chain_exactly_at_max_depth), but appending
+        // even one more real level on top via `or` must push the tree's true depth to
+        // MAX_DEPTH + 1 and be rejected -- exactly like a single flat chain one link
+        // too long already is, just composed across the and/or boundary instead of
+        // within one chain.
+        let expr = format!("{} or active pr", flat_and_chain_expr(MAX_DEPTH));
+        assert_eq!(parse(&expr), Err(FilterError::TooDeep));
+    }
+
+    #[test]
+    fn accepts_an_or_link_appended_onto_an_and_chain_one_short_of_max_depth() {
+        // The boundary-preserving counterpart: an `and` chain one link short of
+        // MAX_DEPTH, with one `or` link appended, lands exactly at MAX_DEPTH and must
+        // still be accepted -- confirms the fix checks real depth precisely rather
+        // than over-rejecting valid composed filters at the boundary.
+        let expr = format!("{} or active pr", flat_and_chain_expr(MAX_DEPTH - 1));
+        assert!(parse(&expr).is_ok());
+    }
+
     #[test]
     fn rejects_binary_or_boolean_compare_value_type_confusion_gracefully() {
         // Not a crash, not a silent misparse -- `pr` with a trailing junk value token is
@@ -896,6 +1048,22 @@ mod tests {
     }
 
     #[test]
+    fn patch_path_rejects_dotted_sub_attribute_before_bracket_filter() {
+        assert_eq!(
+            parse_patch_path(r#"members.display[value eq "u-2"]"#),
+            Err(FilterError::UnexpectedToken(format!(
+                "{:?}",
+                Token::LBracket
+            )))
+        );
+    }
+
+    #[test]
+    fn patch_path_rejects_dotted_sub_attribute_before_bracket_filter_with_trailing_sub_attr() {
+        assert!(parse_patch_path(r#"members.display[value eq "u-2"].value"#).is_err());
+    }
+
+    #[test]
     fn patch_path_bracket_filter_is_still_depth_bounded() {
         let mut expr = String::from("emails[");
         for _ in 0..(MAX_DEPTH + 5) {
@@ -907,6 +1075,33 @@ mod tests {
         }
         expr.push(']');
         assert_eq!(parse_patch_path(&expr), Err(FilterError::TooDeep));
+    }
+
+    #[test]
+    fn tokenizer_makes_progress_on_a_bare_dollar_sign_in_a_patch_path() {
+        // Regression: '$' is accepted as an identifier-*start* character (needed for
+        // "$ref") but historically wasn't in the continuation charset, and the
+        // identifier arm relied on the continuation loop to consume the leading char
+        // itself. That left a lone '$' unable to advance `i` at all, so `tokenize`
+        // looped forever re-matching the same character and grew `tokens` without
+        // bound -- a trivial unauthenticated DoS via any PATCH path or filter string.
+        // A bounded call proves it now terminates: it parses as an (empty, unresolved)
+        // attribute-name path rather than hanging the test suite.
+        let result = parse_patch_path("$");
+        assert!(result.is_ok(), "a lone '$' tokenizes as a single ident: {result:?}");
+    }
+
+    #[test]
+    fn tokenizer_makes_progress_on_a_bare_dollar_sign_in_a_filter() {
+        let result = parse("$");
+        assert!(result.is_err(), "a bare '$' is not a valid filter");
+    }
+
+    #[test]
+    fn tokenizer_handles_dollar_ref_as_a_single_identifier() {
+        // '$' must still work for its actual purpose: the "$ref" sub-attribute name.
+        let tokens = tokenize("$ref").unwrap();
+        assert_eq!(tokens, vec![Token::Ident("$ref".to_string())]);
     }
 
     #[test]
