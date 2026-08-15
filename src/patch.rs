@@ -3046,4 +3046,57 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
     }
+
+    #[test]
+    fn no_path_replace_rejects_three_way_ambiguity_not_just_a_pair() {
+        // The ambiguity check doesn't special-case "exactly two" -- it must reject any
+        // count of 2-or-more equally, not just the minimal pairwise case.
+        let resource = json!({
+            "schemas": ["urn:test:Entry"],
+            "id": "e-1",
+            "entries": [
+                {"value": "dup", "secret": "s1"},
+                {"value": "dup", "secret": "s2"},
+                {"value": "dup", "secret": "s3"}
+            ]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"entries": [{"value": "dup", "secret": "MALLORY"}]})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
+    }
+
+    #[test]
+    fn no_path_replace_rejects_case_insensitive_ambiguity_under_default_case_folding() {
+        // entry_schema's "value" sub-attribute is caseExact:false (the RFC 7643 default,
+        // via AttributeDefinition::simple) -- "dup" and "DUP" correlate to the SAME
+        // identity under this crate's own case-folding rule, so this is genuinely two
+        // entries sharing one identity, not two distinct ones that merely look similar.
+        let resource = json!({
+            "schemas": ["urn:test:Entry"],
+            "id": "e-1",
+            "entries": [
+                {"value": "dup", "secret": "s1"},
+                {"value": "DUP", "secret": "s2"}
+            ]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"entries": [{"value": "Dup", "secret": "MALLORY"}]})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
+    }
 }
