@@ -117,7 +117,7 @@ pub enum PatchError {
     /// safely guess: silently picking one (the old first-match `.find()` behavior) let
     /// an attacker forge the *other* entry's immutable/readOnly sub-attributes
     /// unchecked, since no check ever ran against that entry's own true prior value
-    /// (SPEC-81 audit follow-up, GitHub issue #13). Fail closed instead: reject the
+    /// (GitHub issue #13). Fail closed instead: reject the
     /// write outright rather than pick an arbitrary tie-break. Deliberately
     /// unconditional -- not gated on whether the schema happens to declare an
     /// immutable/readOnly sibling sub-attribute today, since that's exactly the
