@@ -1898,20 +1898,17 @@ mod tests {
 
     // --- Schema-typed PATCH value coercion (real-IdP conformance, GitHub issue #1) ---
     //
-    // mitodl/keycloak-scim (Apache-2.0, actively maintained -- see PR description for the
-    // full evaluation) builds its PATCH `active` op as
-    // `.path("active").op(PatchOp.REPLACE).value(active.toString())`
-    // (`UserAdapter.toPatchBuilder()`, pinned commit
-    // eec8ecd14971886f0d00f3dc688b587c3002f252) -- Java `Boolean#toString()` is the JSON
-    // *string* `"true"`/`"false"`, not RFC 7643's native JSON boolean for a
-    // `boolean`-typed attribute. A strict RFC-literal apply_patch_with_schema would store
-    // that string verbatim, silently corrupting the resource's type shape (a later
-    // `serde_json::from_value::<User>` would then fail on a field the SCIM server itself
-    // accepted). Coercion is deliberately narrow: only `apply_patch_with_schema` (which
-    // has a declared type to coerce *to*) does this, only for exact canonical string
-    // forms of the target type, and only boolean/integer/decimal -- anything else (wrong
-    // case, leading zeros, whitespace, non-numeric) passes through unchanged rather than
-    // being guessed at.
+    // Some real-world SCIM clients build a boolean-attribute PATCH `replace` op by taking
+    // a language-native boolean-to-string conversion (e.g. Java's `Boolean#toString()`)
+    // and putting that JSON *string* `"true"`/`"false"` straight into the wire `value`
+    // field, instead of RFC 7643's native JSON boolean for a `boolean`-typed attribute. A
+    // strict RFC-literal apply_patch_with_schema would store that string verbatim, silently
+    // corrupting the resource's type shape (a later `serde_json::from_value::<User>` would
+    // then fail on a field the SCIM server itself accepted). Coercion is deliberately
+    // narrow: only `apply_patch_with_schema` (which has a declared type to coerce *to*)
+    // does this, only for exact canonical string forms of the target type, and only
+    // boolean/integer/decimal -- anything else (wrong case, leading zeros, whitespace,
+    // non-numeric) passes through unchanged rather than being guessed at.
 
     fn numeric_schema() -> SchemaResource {
         SchemaResource {

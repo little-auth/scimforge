@@ -74,10 +74,7 @@ async fn creates_a_user_from_a_keycloak_plugin_shaped_body() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["userName"], "bjensen");
     assert_eq!(body["active"], true);
-    assert_eq!(
-        body["externalId"],
-        "f47ac10b-58cc-4372-a567-0e02b2c3d479"
-    );
+    assert_eq!(body["externalId"], "f47ac10b-58cc-4372-a567-0e02b2c3d479");
     // The server always assigns its own id -- proving users::create's server-generated-id
     // path actually ran, not just that some id field happens to be present.
     assert!(body["id"].as_str().is_some_and(|id| !id.is_empty()));
@@ -131,7 +128,13 @@ async fn accepts_application_scim_plus_json_content_type() {
 }
 
 #[tokio::test]
-async fn patches_a_boolean_attribute_sent_as_a_keycloak_plugin_shaped_string_value() {
+async fn patches_a_boolean_attribute_sent_as_a_string_valued_replace_op() {
+    // Some real-world SCIM clients PATCH a boolean attribute as the JSON *string*
+    // "true"/"false" rather than a native boolean (see src/patch.rs's coercion doc
+    // comment) -- little-auth/keycloak-scim-client itself doesn't do this
+    // (`ScimTargetClient.setActive` sends a native `BooleanNode`, see the test below), but
+    // scimforge's coercion is generic defensive behavior worth its own direct coverage
+    // regardless of which specific client this harness targets today.
     let router = app();
     let (_, created) = send(
         router.clone(),
@@ -143,7 +146,6 @@ async fn patches_a_boolean_attribute_sent_as_a_keycloak_plugin_shaped_string_val
     .await;
     let id = created["id"].as_str().unwrap();
 
-    // UserAdapter.toPatchBuilder()'s exact shape: value is the JSON string "false".
     let patch_body = json!({
         "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
         "Operations": [
@@ -165,6 +167,44 @@ async fn patches_a_boolean_attribute_sent_as_a_keycloak_plugin_shaped_string_val
     // boolean here -- a strict RFC-literal server would have stored the string verbatim.
     assert_eq!(patched["active"], json!(false));
     assert_eq!(patched["userName"], "bjensen2");
+}
+
+#[tokio::test]
+async fn patches_a_boolean_attribute_sent_as_the_native_boolean_keycloak_scim_client_actually_sends()
+ {
+    // little-auth/keycloak-scim-client's ScimTargetClient.setActive() PATCHes `active` via
+    // `.valueNode(BooleanNode.valueOf(active))` -- a native JSON boolean, never a
+    // string-coerced one. No coercion is needed for this shape (it's already the target
+    // type), but this is the actual wire shape the live conformance test
+    // (tests/keycloak_conformance.rs) expects to observe, so it earns its own direct,
+    // Docker-free regression coverage here too.
+    let router = app();
+    let (_, created) = send(
+        router.clone(),
+        authed("POST", "/Users")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&keycloak_style_create_body()))
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+
+    let patch_body = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "replace", "path": "active", "value": false}
+        ]
+    });
+    let (status, patched) = send(
+        router,
+        authed("PATCH", &format!("/Users/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&patch_body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["active"], json!(false));
 }
 
 #[tokio::test]
