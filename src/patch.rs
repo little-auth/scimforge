@@ -103,6 +103,31 @@ pub enum PatchError {
         attr_name: String,
         mutability: String,
     },
+    /// [`apply_patch_with_schema`] only: correlating an entry of a multi-valued complex
+    /// attribute to its counterpart in another array snapshot (this file's one identity
+    /// convention -- see [`find_entry_by_value`]) found more than one existing entry
+    /// sharing the same `value`. This crate's own shipped schemas make this state
+    /// unreachable (`value` is declared `immutable` for every multi-valued complex
+    /// attribute in `user_schema()`/`group_schema()`, and the immutability check on
+    /// `value` itself already forecloses two entries ever coming to share one), but an
+    /// arbitrary caller-supplied schema (see the module doc on composing extension
+    /// schemas into [`apply_patch_with_schema`]) isn't required to declare `value`
+    /// immutable. When two existing entries genuinely share a `value`, which one is the
+    /// "real" baseline for a write's immutability check is not something this crate can
+    /// safely guess: silently picking one (the old first-match `.find()` behavior) let
+    /// an attacker forge the *other* entry's immutable/readOnly sub-attributes
+    /// unchecked, since no check ever ran against that entry's own true prior value
+    /// (SPEC-81 audit follow-up, GitHub issue #13). Fail closed instead: reject the
+    /// write outright rather than pick an arbitrary tie-break. Deliberately
+    /// unconditional -- not gated on whether the schema happens to declare an
+    /// immutable/readOnly sibling sub-attribute today, since that's exactly the
+    /// invariant a later schema edit could silently invalidate; correlating by `value`
+    /// at all already assumes it uniquely identifies an entry (see
+    /// [`find_entry_by_value`]'s doc comment).
+    AmbiguousEntryIdentity {
+        attr_name: String,
+        value: Value,
+    },
 }
 
 impl From<FilterError> for PatchError {
@@ -125,6 +150,11 @@ impl PatchError {
             PatchError::SchemaQualifiedPath(_) => ScimType::InvalidPath,
             PatchError::ImmutableOrReadOnly(_) => ScimType::Mutability,
             PatchError::InvalidSchemaMutability { .. } => ScimType::InvalidValue,
+            // RFC 7644 3.12 Table 9's "uniqueness" scimType: "One or more of the
+            // attribute values are already in use or are reserved" -- the closest
+            // canonical fit for "this value doesn't uniquely identify an entry," which
+            // is exactly what correlating by it requires.
+            PatchError::AmbiguousEntryIdentity { .. } => ScimType::Uniqueness,
         }
     }
 
@@ -543,13 +573,27 @@ fn value_sub_attr_is_case_exact(attr_def: &discovery::AttributeDefinition) -> bo
 /// `{"value": 42, ...}` entry once, then freely rewrite its other sub-attributes
 /// forever, since `42` (a `Value::Number`) never matched via `.as_str()` on either side.
 /// Comparing the raw `Value` directly closes this for every JSON type uniformly.
+///
+/// Returns `Err(PatchError::AmbiguousEntryIdentity)` if more than one entry in `entries`
+/// matches `key` -- an earlier version used `.find()`, silently returning only the
+/// first match. This crate's own shipped schemas make that state unreachable (`value`
+/// is always `immutable` there), but nothing stops an arbitrary caller-supplied schema
+/// (passed to [`apply_patch_with_schema`]) from leaving `value` `readWrite` while some
+/// other sub-attribute is `immutable`/`readOnly`. In that shape, two existing entries
+/// really can come to share a `value`, and picking one arbitrarily as the correlation
+/// baseline lets an attacker forge the *other* entry's immutable field with zero
+/// validation against its own true prior value (GitHub issue #13). This is deliberately
+/// every caller's problem, not just the one that happens to trip over it: every call
+/// site funnels through here, so this is the one place that needs to fail closed for
+/// all of them to.
 fn find_entry_by_value<'a>(
+    attr_name: &str,
     entries: &'a [Value],
     attr_def: &discovery::AttributeDefinition,
     key: &Value,
-) -> Option<&'a Value> {
+) -> Result<Option<&'a Value>, PatchError> {
     let case_exact = value_sub_attr_is_case_exact(attr_def);
-    entries.iter().find(|e| {
+    let mut matches = entries.iter().filter(|e| {
         let Some(existing_key) = e.get("value") else {
             return false;
         };
@@ -563,7 +607,17 @@ fn find_entry_by_value<'a>(
             }
             (a, b) => a == b,
         }
-    })
+    });
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(PatchError::AmbiguousEntryIdentity {
+            attr_name: attr_name.to_string(),
+            value: key.clone(),
+        });
+    }
+    Ok(Some(first))
 }
 
 /// Guards a whole-attribute replace/add of a complex attribute (single-valued or
@@ -625,15 +679,26 @@ fn check_multivalued_complex_replace_mutability(
         // let an attacker spell the key as e.g. "Value", missing this lookup entirely
         // and skipping check_entry_immutable_sub_attrs for that entry altogether,
         // silently forging any of its immutable/readOnly sub-attributes (display,
-        // $ref, type) unchecked. Every case-variant "value"-named key present is
-        // tried against find_entry_by_value: if ANY of them correlates to an existing
-        // entry, the immutability check runs against that baseline.
-        let Some(existing_entry) = existing_entries.and_then(|entries| {
-            new_obj
-                .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case("value"))
-                .find_map(|(_, new_key)| find_entry_by_value(entries, attr_def, new_key))
-        }) else {
+        // $ref, type) unchecked. Every case-variant "value"-named key present is tried
+        // against find_entry_by_value: if ANY of them correlates to an existing entry,
+        // the immutability check runs against that baseline. `?` propagates immediately
+        // on the first case-variant key that finds an ambiguous existing match (see
+        // find_entry_by_value's doc comment, issue #13) rather than silently trying the
+        // next case-variant key as if this one simply hadn't matched.
+        let mut existing_entry = None;
+        for (_, new_key) in new_obj
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("value"))
+        {
+            let Some(entries) = existing_entries else {
+                break;
+            };
+            if let Some(found) = find_entry_by_value(attr_name, entries, attr_def, new_key)? {
+                existing_entry = Some(found);
+                break;
+            }
+        }
+        let Some(existing_entry) = existing_entry else {
             continue;
         };
         check_entry_immutable_sub_attrs(attr_name, attr_def, existing_entry, new_entry)?;
@@ -805,13 +870,26 @@ fn apply_add_or_replace(
                             // live `entry` only if no corresponding entry exists in the
                             // snapshot at all (e.g. this entry was added earlier in the
                             // same request), matching the add-exception's "no previous
-                            // value" case.
-                            let original_match = entry.get("value").and_then(|key| {
-                                original
+                            // value" case. `?` propagates a
+                            // PatchError::AmbiguousEntryIdentity immediately rather than
+                            // falling back to the live `entry` -- that fallback is only
+                            // for "no corresponding entry", never "more than one" (see
+                            // find_entry_by_value's doc comment, issue #13).
+                            let original_match = match entry.get("value") {
+                                Some(key) => match original
                                     .get(&path.attr_path.attr_name)
                                     .and_then(Value::as_array)
-                                    .and_then(|arr| find_entry_by_value(arr, attr_def, key))
-                            });
+                                {
+                                    Some(arr) => find_entry_by_value(
+                                        &path.attr_path.attr_name,
+                                        arr,
+                                        attr_def,
+                                        key,
+                                    )?,
+                                    None => None,
+                                },
+                                None => None,
+                            };
                             check_entry_immutable_sub_attrs(
                                 &path.attr_path.attr_name,
                                 attr_def,
@@ -1487,6 +1565,14 @@ mod tests {
             ScimType::Mutability
         );
         assert_eq!(PatchError::NoMatchingValue.scim_type(), ScimType::NoTarget);
+        assert_eq!(
+            PatchError::AmbiguousEntryIdentity {
+                attr_name: "members".to_string(),
+                value: json!("dup"),
+            }
+            .scim_type(),
+            ScimType::Uniqueness
+        );
     }
 
     #[test]
@@ -2780,5 +2866,184 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result["displayName"], "New Name");
+    }
+
+    // --- Ambiguous entry-identity correlation for a caller-supplied schema (issue #13) ---
+    //
+    // This crate's own shipped schemas (`user_schema()`/`group_schema()`) always declare
+    // a multi-valued complex attribute's `value` sub-attribute `immutable`, so two
+    // existing entries can never come to share one -- the immutability check on `value`
+    // itself already forecloses it. `apply_patch_with_schema` accepts an arbitrary
+    // caller-supplied schema though, and nothing requires that. `entry_schema` below is
+    // exactly that hypothetical: `value` is `readWrite` (so duplicates are reachable)
+    // while `secret` is `immutable` (so a duplicate is actually dangerous, not just
+    // untidy) -- the precise shape the ticket describes.
+
+    /// A synthetic schema for a multi-valued complex `entries` attribute whose `value`
+    /// sub-attribute is left at the default `readWrite` mutability (unlike every
+    /// multi-valued complex attribute in this crate's own shipped schemas) while
+    /// `secret` is `immutable` -- the one shape where two existing entries sharing a
+    /// `value` is both reachable and dangerous, since `find_entry_by_value`'s
+    /// first-match correlation would otherwise silently pick one as the baseline for
+    /// `secret`'s immutability check, leaving the other's `secret` unchecked.
+    fn entry_schema() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Entry".to_string(),
+            name: Some("Entry".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                multi_valued: true,
+                sub_attributes: vec![
+                    crate::discovery::AttributeDefinition::simple(
+                        "value",
+                        "string",
+                        "Correlation key -- deliberately NOT immutable.",
+                        "readWrite",
+                    ),
+                    crate::discovery::AttributeDefinition::simple(
+                        "secret",
+                        "string",
+                        "Immutable payload guarded by value-based correlation.",
+                        "immutable",
+                    ),
+                ],
+                ..crate::discovery::AttributeDefinition::simple(
+                    "entries",
+                    "complex",
+                    "A list of entries.",
+                    "readWrite",
+                )
+            }],
+        }
+    }
+
+    fn resource_with_two_ambiguous_entries() -> Value {
+        json!({
+            "schemas": ["urn:test:Entry"],
+            "id": "e-1",
+            "entries": [
+                {"value": "dup", "secret": "first-secret"},
+                {"value": "dup", "secret": "second-secret"}
+            ]
+        })
+    }
+
+    #[test]
+    fn no_path_replace_rejects_correlating_against_an_ambiguous_existing_value() {
+        // Without the fix, find_entry_by_value's first-match .find() would silently pick
+        // the FIRST "dup" entry as the baseline, find it has no conflicting "secret"
+        // supplied (the attacker's payload doesn't even need to know either baseline
+        // value), and let the write through -- forging the SECOND entry's immutable
+        // "secret" with zero validation against its own true prior value.
+        let resource = resource_with_two_ambiguous_entries();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"entries": [{"value": "dup", "secret": "MALLORY"}]})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap_err();
+        match err {
+            PatchError::AmbiguousEntryIdentity { attr_name, value } => {
+                assert_eq!(attr_name, "entries");
+                assert_eq!(value, json!("dup"));
+            }
+            other => panic!("expected AmbiguousEntryIdentity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bracket_filter_replace_rejects_correlating_against_an_ambiguous_existing_value() {
+        // Same underlying gap, reproduced via the bracket-filter whole-entry-replace call
+        // site (a distinct code path sharing the same find_entry_by_value helper).
+        let resource = resource_with_two_ambiguous_entries();
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"entries[value eq "dup"]"#),
+                Some(json!({"value": "dup", "secret": "MALLORY"})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
+    }
+
+    #[test]
+    fn ambiguous_entry_rejection_never_panics_on_malformed_entries_mixed_in() {
+        // Adversarial/malformed array entries (bare strings, numbers, null) alongside a
+        // genuinely ambiguous pair must degrade to a typed Result, never index/unwrap
+        // into a shape that isn't there -- same control-test property as
+        // immutable_add_check_never_panics_on_a_non_object_array_entry.
+        let resource = json!({
+            "schemas": ["urn:test:Entry"],
+            "id": "e-1",
+            "entries": [
+                "not-an-object",
+                42,
+                null,
+                {"value": "dup", "secret": "first-secret"},
+                {"value": "dup", "secret": "second-secret"}
+            ]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"entries": [{"value": "dup", "secret": "MALLORY"}]})),
+            )],
+            &entry_schema(),
+        );
+        assert!(matches!(
+            result,
+            Err(PatchError::AmbiguousEntryIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn no_path_replace_still_allows_a_genuine_add_with_no_correlating_existing_entry() {
+        // A new entry whose value doesn't correlate to anything existing is a genuine
+        // addition (RFC 7644 3.5.2's add-exception) -- the ambiguity check must not
+        // misfire on the zero-match case, only the 2-or-more-match case.
+        let resource = resource_with_two_ambiguous_entries();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some("entries"),
+                Some(json!({"value": "brand-new", "secret": "s3"})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["entries"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn no_path_replace_still_rejects_a_genuine_single_baseline_forgery() {
+        // Proves the fix didn't regress the original (single, unambiguous match)
+        // detection this file already had -- only the 2-or-more-match case is new.
+        let resource = json!({
+            "schemas": ["urn:test:Entry"],
+            "id": "e-1",
+            "entries": [{"value": "u-1", "secret": "real-secret"}]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"entries": [{"value": "u-1", "secret": "MALLORY"}]})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
     }
 }
