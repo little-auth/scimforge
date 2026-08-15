@@ -274,9 +274,9 @@ fn stricter(a: Mutability, b: Mutability) -> Mutability {
 /// previous value let an attacker add previously-unset fields to an already-existing
 /// immutable complex value one field at a time, forever, since each individual field
 /// really was unset in isolation -- the parent's own existing value never entered the
-/// check at all (found by this fix's own adversarial confirmation pass; regression
-/// tests: `check_mutability_rejects_add_to_a_cascaded_immutable_sub_attribute_when_the_
-/// entry_already_exists` and its `_parent_already_has_a_value` sibling).
+/// check at all (found by this fix's own adversarial confirmation pass; see this
+/// module's tests for the `_when_the_entry_already_exists` and
+/// `_when_the_parent_already_has_a_value` regression cases).
 fn check_mutability(
     schema: &SchemaResource,
     resource: &Value,
