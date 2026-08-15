@@ -126,10 +126,10 @@ pub enum PatchError {
     /// `crate::user`), and real IdP traffic routinely sends two emails sharing an
     /// address under different `type`s -- an earlier, unconditional version of this
     /// check rejected that legitimate write outright for zero security benefit, a real
-    /// functional regression against this crate's own shipped schema caught by a
-    /// confirmation pass before it shipped. The gate is recomputed fresh from the
-    /// schema on every call rather than validated once, so it stays correct even if a
-    /// schema is edited later to add a protected sibling sub-attribute.
+    /// functional regression against this crate's own shipped schema. The gate is
+    /// recomputed fresh from the schema on every call rather than validated once, so
+    /// it stays correct even if a schema is edited later to add a protected sibling
+    /// sub-attribute.
     AmbiguousEntryIdentity {
         attr_name: String,
         value: Value,
@@ -575,8 +575,8 @@ fn value_sub_attr_is_case_exact(attr_def: &discovery::AttributeDefinition) -> bo
 /// multi-valued complex attribute in this crate's own shipped schemas declares
 /// `value` immutable (only true of `Group.members`, not `User.emails`/`phoneNumbers`
 /// /`ims`) -- a real functional regression against this crate's own shipped
-/// `user_schema()`, not just a hypothetical custom one (GitHub issue #13 security-audit
-/// follow-up, confirmation pass). Recomputed fresh from `attr_def` on every call
+/// `user_schema()`, not just a hypothetical custom one (GitHub issue #13). Recomputed
+/// fresh from `attr_def` on every call
 /// rather than cached or validated once at schema-authoring time, so a schema edited
 /// later to add an immutable sibling sub-attribute is protected on its very next
 /// PATCH call, not just from whenever someone remembers to re-validate it.
@@ -628,10 +628,9 @@ fn multivalued_complex_attr_has_a_protected_sub_attr(
 /// and real IdP traffic routinely sends two emails sharing an address under different
 /// `type`s (work/home) -- an unconditional rejection would fail that legitimate,
 /// RFC-compliant write outright for no security benefit (nothing immutable is at
-/// stake there), the exact false positive an early version of this fix shipped with
-/// before a confirmation pass caught it against `user_schema()`. When ambiguous but
-/// unprotected, this degrades to the pre-fix behavior (an arbitrary but harmless
-/// baseline pick) rather than needlessly rejecting the write.
+/// stake there). When ambiguous but unprotected, this degrades to the pre-fix
+/// behavior (an arbitrary but harmless baseline pick) rather than needlessly
+/// rejecting the write.
 fn find_entry_by_value<'a>(
     attr_name: &str,
     entries: &'a [Value],
@@ -3210,8 +3209,7 @@ mod tests {
         assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
     }
 
-    // --- Ambiguity gate must not reject an unprotected shipped attribute (issue #13
-    // confirmation-pass follow-up) ---
+    // --- Ambiguity gate must not reject an unprotected shipped attribute (issue #13) ---
     //
     // An earlier version of this fix rejected ANY ambiguous `value` correlation
     // unconditionally, on the mistaken premise that every multi-valued complex
