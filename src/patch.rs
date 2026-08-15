@@ -106,24 +106,30 @@ pub enum PatchError {
     /// [`apply_patch_with_schema`] only: correlating an entry of a multi-valued complex
     /// attribute to its counterpart in another array snapshot (this file's one identity
     /// convention -- see `find_entry_by_value`) found more than one existing entry
-    /// sharing the same `value`. This crate's own shipped schemas make this state
-    /// unreachable (`value` is declared `immutable` for every multi-valued complex
-    /// attribute in `user_schema()`/`group_schema()`, and the immutability check on
-    /// `value` itself already forecloses two entries ever coming to share one), but an
-    /// arbitrary caller-supplied schema (see the module doc on composing extension
-    /// schemas into [`apply_patch_with_schema`]) isn't required to declare `value`
-    /// immutable. When two existing entries genuinely share a `value`, which one is the
-    /// "real" baseline for a write's immutability check is not something this crate can
-    /// safely guess: silently picking one (the old first-match `.find()` behavior) let
-    /// an attacker forge the *other* entry's immutable/readOnly sub-attributes
-    /// unchecked, since no check ever ran against that entry's own true prior value
-    /// (GitHub issue #13). Fail closed instead: reject the
-    /// write outright rather than pick an arbitrary tie-break. Deliberately
-    /// unconditional -- not gated on whether the schema happens to declare an
-    /// immutable/readOnly sibling sub-attribute today, since that's exactly the
-    /// invariant a later schema edit could silently invalidate; correlating by `value`
-    /// at all already assumes it uniquely identifies an entry (see
-    /// `find_entry_by_value`'s doc comment).
+    /// sharing the same `value`, for an attribute that has something immutable/readOnly
+    /// to protect (see `multivalued_complex_attr_has_a_protected_sub_attr`). This
+    /// crate's own shipped `Group.members` makes ambiguity unreachable (`value` is
+    /// declared `immutable` there, and the immutability check on `value` itself already
+    /// forecloses two entries ever coming to share one), but an arbitrary
+    /// caller-supplied schema (see the module doc on composing extension schemas into
+    /// [`apply_patch_with_schema`]) isn't required to declare `value` immutable. When
+    /// two existing entries genuinely share a `value` while some other sub-attribute is
+    /// immutable/readOnly, which one is the "real" baseline for a write's immutability
+    /// check is not something this crate can safely guess: silently picking one (the
+    /// old first-match `.find()` behavior) let an attacker forge the *other* entry's
+    /// immutable/readOnly sub-attributes unchecked, since no check ever ran against
+    /// that entry's own true prior value (GitHub issue #13). Fail closed instead:
+    /// reject the write outright rather than pick an arbitrary tie-break. Gated on
+    /// whether there's actually something to protect, not unconditional: this crate's
+    /// own `User.emails`/`phoneNumbers`/`ims` are multi-valued complex attributes with
+    /// no immutable sub-attribute at all (see `multi_valued_string_attr` in
+    /// `crate::user`), and real IdP traffic routinely sends two emails sharing an
+    /// address under different `type`s -- an earlier, unconditional version of this
+    /// check rejected that legitimate write outright for zero security benefit, a real
+    /// functional regression against this crate's own shipped schema caught by a
+    /// confirmation pass before it shipped. The gate is recomputed fresh from the
+    /// schema on every call rather than validated once, so it stays correct even if a
+    /// schema is edited later to add a protected sibling sub-attribute.
     AmbiguousEntryIdentity {
         attr_name: String,
         value: Value,
@@ -554,6 +560,37 @@ fn value_sub_attr_is_case_exact(attr_def: &discovery::AttributeDefinition) -> bo
         .is_some_and(|s| s.case_exact)
 }
 
+/// Whether `attr_def` has at least one sub-attribute (possibly `value` itself)
+/// declared `immutable` or `readOnly` -- i.e. whether correlating this attribute's
+/// entries by `value` is actually guarding something an attacker could forge, or is
+/// mere bookkeeping with nothing at stake. Two of this crate's own shipped
+/// multi-valued complex attributes land on opposite sides of this: `Group.members`
+/// (`value`/`display`/`$ref` all `immutable`) has plenty to protect, but `User.emails`
+/// /`phoneNumbers`/`ims` (every sub-attribute, `value` included, left at the default
+/// `readWrite` -- see `multi_valued_string_attr` in `crate::user`) have nothing
+/// immutable at all. Real IdP traffic routinely sends two emails sharing the same
+/// address under different `type`s (work/home) -- an earlier version of the
+/// ambiguity check in [`find_entry_by_value`] rejected that outright with
+/// `PatchError::AmbiguousEntryIdentity`, on the mistaken premise that every
+/// multi-valued complex attribute in this crate's own shipped schemas declares
+/// `value` immutable (only true of `Group.members`, not `User.emails`/`phoneNumbers`
+/// /`ims`) -- a real functional regression against this crate's own shipped
+/// `user_schema()`, not just a hypothetical custom one (GitHub issue #13 security-audit
+/// follow-up, confirmation pass). Recomputed fresh from `attr_def` on every call
+/// rather than cached or validated once at schema-authoring time, so a schema edited
+/// later to add an immutable sibling sub-attribute is protected on its very next
+/// PATCH call, not just from whenever someone remembers to re-validate it.
+fn multivalued_complex_attr_has_a_protected_sub_attr(
+    attr_def: &discovery::AttributeDefinition,
+) -> bool {
+    attr_def.sub_attributes.iter().any(|s| {
+        matches!(
+            Mutability::from_rfc_str(&s.mutability),
+            Some(Mutability::Immutable | Mutability::ReadOnly)
+        )
+    })
+}
+
 /// Finds the entry in `entries` whose `value` sub-attribute matches `key`, per
 /// `attr_def`'s declared `caseExact` for that sub-attribute (see
 /// [`value_sub_attr_is_case_exact`]) when both sides are strings, or exact `Value`
@@ -574,18 +611,27 @@ fn value_sub_attr_is_case_exact(attr_def: &discovery::AttributeDefinition) -> bo
 /// forever, since `42` (a `Value::Number`) never matched via `.as_str()` on either side.
 /// Comparing the raw `Value` directly closes this for every JSON type uniformly.
 ///
-/// Returns `Err(PatchError::AmbiguousEntryIdentity)` if more than one entry in `entries`
-/// matches `key` -- an earlier version used `.find()`, silently returning only the
-/// first match. This crate's own shipped schemas make that state unreachable (`value`
-/// is always `immutable` there), but nothing stops an arbitrary caller-supplied schema
-/// (passed to [`apply_patch_with_schema`]) from leaving `value` `readWrite` while some
-/// other sub-attribute is `immutable`/`readOnly`. In that shape, two existing entries
-/// really can come to share a `value`, and picking one arbitrarily as the correlation
+/// Returns `Err(PatchError::AmbiguousEntryIdentity)` if more than one entry in
+/// `entries` matches `key` AND `attr_def` has something to protect (see
+/// [`multivalued_complex_attr_has_a_protected_sub_attr`]) -- an earlier version used
+/// `.find()`, silently returning only the first match, unconditionally. This crate's
+/// own shipped `Group.members` makes ambiguity unreachable (`value` is `immutable`
+/// there), but nothing stops an arbitrary caller-supplied schema (passed to
+/// [`apply_patch_with_schema`]) from leaving `value` `readWrite` while some other
+/// sub-attribute is `immutable`/`readOnly`. In that shape, two existing entries really
+/// can come to share a `value`, and picking one arbitrarily as the correlation
 /// baseline lets an attacker forge the *other* entry's immutable field with zero
-/// validation against its own true prior value (GitHub issue #13). This is deliberately
-/// every caller's problem, not just the one that happens to trip over it: every call
-/// site funnels through here, so this is the one place that needs to fail closed for
-/// all of them to.
+/// validation against its own true prior value (GitHub issue #13). Gating on whether
+/// there's actually something immutable/readOnly to protect matters just as much as
+/// the fail-closed rejection itself: this crate's own `User.emails`/`phoneNumbers`
+/// /`ims` are multi-valued complex attributes whose `value` is *not* immutable either,
+/// and real IdP traffic routinely sends two emails sharing an address under different
+/// `type`s (work/home) -- an unconditional rejection would fail that legitimate,
+/// RFC-compliant write outright for no security benefit (nothing immutable is at
+/// stake there), the exact false positive an early version of this fix shipped with
+/// before a confirmation pass caught it against `user_schema()`. When ambiguous but
+/// unprotected, this degrades to the pre-fix behavior (an arbitrary but harmless
+/// baseline pick) rather than needlessly rejecting the write.
 fn find_entry_by_value<'a>(
     attr_name: &str,
     entries: &'a [Value],
@@ -611,7 +657,7 @@ fn find_entry_by_value<'a>(
     let Some(first) = matches.next() else {
         return Ok(None);
     };
-    if matches.next().is_some() {
+    if matches.next().is_some() && multivalued_complex_attr_has_a_protected_sub_attr(attr_def) {
         return Err(PatchError::AmbiguousEntryIdentity {
             attr_name: attr_name.to_string(),
             value: key.clone(),
@@ -680,21 +726,28 @@ fn check_multivalued_complex_replace_mutability(
         // and skipping check_entry_immutable_sub_attrs for that entry altogether,
         // silently forging any of its immutable/readOnly sub-attributes (display,
         // $ref, type) unchecked. Every case-variant "value"-named key present is tried
-        // against find_entry_by_value, and EVERY one that correlates to something must
-        // agree on which existing entry that is (compared by reference identity, since
-        // they all borrow from the same `entries` slice) -- not just whichever
-        // candidate happens to be tried first. `serde_json::Map` here is a `BTreeMap`
-        // (this crate doesn't enable `preserve_order`), so iteration order is
-        // key-sorted, not insertion-order: "Value" sorts before "value" (ASCII 'V' <
-        // 'v'), meaning a naive "first successful candidate wins, stop there" loop
-        // could resolve via a *later*, unambiguous candidate key without ever
-        // evaluating an *earlier*, genuinely ambiguous one -- letting a two-differently
-        // -cased-"value"-keys entry dodge the ambiguity check entirely (issue #13
-        // security-audit follow-up). This mirrors the same reasoning
-        // check_entry_immutable_sub_attrs already applies to decoy sub-attribute keys:
-        // an entry that doesn't unambiguously agree on its own correlated identity
-        // across every case-variant key present is itself adversarial-shaped input, not
-        // something safe to resolve with a single arbitrary tie-break.
+        // against find_entry_by_value, and -- for an attribute that actually has
+        // something immutable/readOnly to protect (see
+        // multivalued_complex_attr_has_a_protected_sub_attr; skipping this gate would
+        // reject e.g. User.emails' entirely legitimate duplicate-address entries the
+        // same way an unconditional find_entry_by_value would, see that function's
+        // doc comment) -- EVERY candidate that correlates to something must agree on
+        // which existing entry that is (compared by reference identity, since they all
+        // borrow from the same `entries` slice), not just whichever candidate happens
+        // to be tried first. `serde_json::Map` here is a `BTreeMap` (this crate
+        // doesn't enable `preserve_order`), so iteration order is key-sorted, not
+        // insertion-order: "Value" sorts before "value" (ASCII 'V' < 'v'), meaning a
+        // naive "first successful candidate wins, stop there" loop could resolve via a
+        // *later*, unambiguous candidate key without ever evaluating an *earlier*,
+        // genuinely ambiguous one -- letting a two-differently-cased-"value"-keys
+        // entry dodge the ambiguity check entirely (issue #13 security-audit
+        // follow-up). This mirrors the same reasoning check_entry_immutable_sub_attrs
+        // already applies to decoy sub-attribute keys: an entry that doesn't
+        // unambiguously agree on its own correlated identity across every case-variant
+        // key present is itself adversarial-shaped input, not something safe to
+        // resolve with a single arbitrary tie-break -- but only when there's something
+        // that tie-break could actually cost.
+        let is_protected = multivalued_complex_attr_has_a_protected_sub_attr(attr_def);
         let mut existing_entry: Option<&Value> = None;
         for (_, new_key) in new_obj
             .iter()
@@ -705,7 +758,7 @@ fn check_multivalued_complex_replace_mutability(
             };
             if let Some(found) = find_entry_by_value(attr_name, entries, attr_def, new_key)? {
                 match existing_entry {
-                    Some(prior) if !std::ptr::eq(prior, found) => {
+                    Some(prior) if is_protected && !std::ptr::eq(prior, found) => {
                         return Err(PatchError::AmbiguousEntryIdentity {
                             attr_name: attr_name.to_string(),
                             value: new_key.clone(),
@@ -3155,5 +3208,128 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
+    }
+
+    // --- Ambiguity gate must not reject an unprotected shipped attribute (issue #13
+    // confirmation-pass follow-up) ---
+    //
+    // An earlier version of this fix rejected ANY ambiguous `value` correlation
+    // unconditionally, on the mistaken premise that every multi-valued complex
+    // attribute in this crate's own shipped schemas declares `value` immutable. That's
+    // only true of `Group.members` -- `User.emails`/`phoneNumbers`/`ims` (built by
+    // `multi_valued_string_attr` in `crate::user`) leave EVERY sub-attribute, `value`
+    // included, at the default `readWrite`. Real IdP traffic routinely sends two
+    // emails sharing the same address under different `type`s (work/home); an
+    // unconditional rejection broke that legitimate, RFC-compliant write for zero
+    // security benefit, since nothing immutable is at stake for `emails` at all.
+
+    fn user_with_two_emails_sharing_an_address() -> Value {
+        json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "id": "u-1",
+            "userName": "bjensen",
+            "emails": [
+                {"value": "shared@example.com", "type": "work", "primary": true},
+                {"value": "shared@example.com", "type": "home"}
+            ]
+        })
+    }
+
+    #[test]
+    fn no_path_replace_still_allows_ambiguous_duplicate_emails_since_nothing_is_immutable_there() {
+        let resource = user_with_two_emails_sharing_an_address();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "emails": [
+                        {"value": "shared@example.com", "type": "work", "primary": true},
+                        {"value": "shared@example.com", "type": "home"},
+                        {"value": "new@example.com", "type": "other"}
+                    ]
+                })),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["emails"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn bracket_filter_whole_entry_replace_still_allows_an_ambiguous_duplicate_email() {
+        // No trailing sub-attribute after the filter (unlike a `.primary`-suffixed
+        // path), so this hits apply_add_or_replace's whole-entry-replace branch --
+        // the one that actually calls find_entry_by_value to establish each matched
+        // live entry's original-snapshot baseline. A `.primary`-suffixed path never
+        // reaches find_entry_by_value at all (it inserts the sub-attribute directly),
+        // so it wouldn't exercise this fix.
+        let resource = user_with_two_emails_sharing_an_address();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"emails[value eq "shared@example.com"]"#),
+                Some(json!({"value": "shared@example.com", "type": "other"})),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        // A non-unique filter matches every entry it selects and whole-replaces each
+        // one with the same payload -- pre-existing, documented behavior for a filter
+        // that isn't unique to begin with (unrelated to this fix); both duplicate
+        // entries end up identical.
+        assert_eq!(result["emails"][0]["type"], "other");
+        assert_eq!(result["emails"][1]["type"], "other");
+    }
+
+    #[test]
+    fn no_path_replace_still_allows_decoy_cased_value_keys_for_an_unprotected_attribute() {
+        // Mirrors no_path_replace_rejects_decoy_cased_value_keys_that_disagree_on_which
+        // _entry_they_correlate_to, but for an attribute (emails) with nothing
+        // immutable/readOnly to protect -- the cross-candidate-key agreement
+        // requirement must not misfire here either.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "id": "u-1",
+            "userName": "bjensen",
+            "emails": [
+                {"value": "shared@example.com", "type": "work"},
+                {"value": "shared@example.com", "type": "home"},
+                {"value": "elsewhere@example.com", "type": "other"}
+            ]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "emails": [
+                        {"value": "shared@example.com", "Value": "elsewhere@example.com", "type": "new"}
+                    ]
+                })),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["emails"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn multivalued_complex_attr_has_a_protected_sub_attr_distinguishes_members_from_emails() {
+        let group_schema = crate::group::group_schema();
+        let group_members =
+            crate::discovery::find_attribute(&group_schema, "members", None).unwrap();
+        assert!(multivalued_complex_attr_has_a_protected_sub_attr(
+            group_members
+        ));
+
+        let user_schema = crate::user::user_schema();
+        let user_emails = crate::discovery::find_attribute(&user_schema, "emails", None).unwrap();
+        assert!(!multivalued_complex_attr_has_a_protected_sub_attr(
+            user_emails
+        ));
     }
 }
