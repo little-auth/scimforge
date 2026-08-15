@@ -254,29 +254,46 @@ fn stricter(a: Mutability, b: Mutability) -> Mutability {
 /// the sub-attribute's own definition, so without this, a readOnly/immutable parent (e.g.
 /// `User.groups`) gave no protection at all to a sub-attribute the schema left unmarked
 /// (defaulting to readWrite per RFC 7643 §2.2), regardless of the parent's own mutability.
-/// This crate's own shipped schemas don't have a live gap here (every readOnly/immutable
-/// complex attribute they declare has every sub-attribute hand-annotated to match), but
-/// [`apply_patch_with_schema`]'s own doc comment explicitly invites a caller to
-/// hand-assemble/merge a schema (e.g. for an extension), and nothing stopped a future
-/// schema -- shipped or caller-supplied -- from reopening this exact gap. See GitHub
-/// issue #12.
+/// This crate's own shipped schemas don't have a live gap for an *unmarked* sub-attribute
+/// (every readOnly/immutable complex attribute they declare has every declared
+/// sub-attribute hand-annotated to match), but [`apply_patch_with_schema`]'s own doc
+/// comment explicitly invites a caller to hand-assemble/merge a schema (e.g. for an
+/// extension), and nothing stopped a future schema -- shipped or caller-supplied -- from
+/// reopening this exact gap. See GitHub issue #12.
+///
+/// The parent is resolved *first*, unconditionally, precisely so a sub-attribute that
+/// isn't declared in the schema at all (not even with a looser mutability -- genuinely
+/// absent from `sub_attributes`) still inherits the parent's mutability rather than
+/// silently falling through the "can't classify what this schema doesn't know about"
+/// early-return below. This was a live, currently-exploitable gap against this crate's
+/// own shipped `user_schema()`, not just a hypothetical: `groups[value eq "x"].primary`
+/// (`primary` is never declared among `User.groups`'s sub-attributes) bypassed `groups`'s
+/// readOnly protection outright, the same way `groups[].type` and `groups[].$ref` once
+/// did before those two were individually added to the schema (see this module's own
+/// regression tests for that history) -- a per-name data patch that only closes the gap
+/// for names someone thought to enumerate, never the structural cause. RFC 7643 §2.2's
+/// own stated default for `mutability` is `readWrite`, so an undeclared sub-attribute
+/// classifies exactly like one that's declared but left at that default: found by this
+/// fix's own second adversarial confirmation pass.
 ///
 /// Cascading *which* mutability applies isn't sufficient on its own: the immutable
 /// add-exception's "had no previous value" check (below, via
 /// [`attribute_has_existing_value`]) must also be scoped to whichever attribute is
 /// actually doing the protecting. `existing_value_sub_attr` is `sub_attr` unchanged when
-/// the sub-attribute's own mutability is at least as strict as its parent's (preserving
-/// this crate's established per-sub-attribute precision, e.g. `Group.members[].display`
-/// -- an entry that already exists but never had `display` set may still receive it), or
-/// `None` (the parent as a whole) when the parent's mutability is what cascaded in.
-/// Getting this wrong doesn't just misclassify severity: cascading `Immutable` from the
-/// parent while still asking whether *this never-before-set sub-attribute* has a
-/// previous value let an attacker add previously-unset fields to an already-existing
-/// immutable complex value one field at a time, forever, since each individual field
-/// really was unset in isolation -- the parent's own existing value never entered the
-/// check at all (found by this fix's own adversarial confirmation pass; see this
-/// module's tests for the `_when_the_entry_already_exists` and
-/// `_when_the_parent_already_has_a_value` regression cases).
+/// the sub-attribute is declared and its own mutability is at least as strict as its
+/// parent's (preserving this crate's established per-sub-attribute precision, e.g.
+/// `Group.members[].display` -- an entry that already exists but never had `display` set
+/// may still receive it), or `None` (the parent as a whole) when the parent's mutability
+/// is what cascaded in -- which includes every undeclared sub-attribute, since there's no
+/// child annotation to weigh against the parent's at all. Getting this wrong doesn't just
+/// misclassify severity: cascading `Immutable` from the parent while still asking whether
+/// *this never-before-set sub-attribute* has a previous value let an attacker add
+/// previously-unset fields to an already-existing immutable complex value one field at a
+/// time, forever, since each individual field really was unset in isolation -- the
+/// parent's own existing value never entered the check at all (found by this fix's own
+/// first adversarial confirmation pass; see this module's tests for the
+/// `_when_the_entry_already_exists` and `_when_the_parent_already_has_a_value` regression
+/// cases).
 fn check_mutability(
     schema: &SchemaResource,
     resource: &Value,
@@ -285,43 +302,51 @@ fn check_mutability(
     value_filter: Option<&Filter>,
     op: PatchOp,
 ) -> Result<(), PatchError> {
-    let Some(attr_def) = discovery::find_attribute(schema, attr_name, sub_attr) else {
-        // An attribute this schema doesn't know about (an unmodeled extension, say) --
-        // not this function's job to reject what it can't classify.
+    let Some(parent_def) = discovery::find_attribute(schema, attr_name, None) else {
+        // The top-level attribute itself isn't in this schema (an unmodeled extension,
+        // say) -- not this function's job to reject what it can't classify. This is
+        // deliberately narrower than "can't classify the full path": once the parent
+        // resolves, there IS something to enforce, even for an undeclared sub-attribute
+        // (see this function's own doc comment).
         return Ok(());
     };
-    let mutability = Mutability::from_rfc_str(&attr_def.mutability).ok_or_else(|| {
+    let parent_mutability = Mutability::from_rfc_str(&parent_def.mutability).ok_or_else(|| {
         PatchError::InvalidSchemaMutability {
             attr_name: attr_name.to_string(),
-            mutability: attr_def.mutability.clone(),
+            mutability: parent_def.mutability.clone(),
         }
     })?;
     let (mutability, existing_value_sub_attr) = match sub_attr {
-        None => (mutability, sub_attr),
-        Some(_) => match discovery::find_attribute(schema, attr_name, None) {
-            // Structurally always `Some` here: `find_attribute` only ever resolves a
-            // sub-attribute by first resolving its parent by `attr_name` (see its own
-            // doc), so `attr_def` having resolved above already implies this does too.
-            // Falling back to the sub-attribute's own mutability/scope rather than a
-            // `panic!`/`.expect` keeps this function total even if that invariant is
-            // ever violated.
-            Some(parent_def) => {
-                let parent_mutability = Mutability::from_rfc_str(&parent_def.mutability)
-                    .ok_or_else(|| PatchError::InvalidSchemaMutability {
-                        attr_name: attr_name.to_string(),
-                        mutability: parent_def.mutability.clone(),
+        None => (parent_mutability, sub_attr),
+        Some(sub) => match parent_def
+            .sub_attributes
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(sub))
+        {
+            Some(sub_def) => {
+                let sub_mutability =
+                    Mutability::from_rfc_str(&sub_def.mutability).ok_or_else(|| {
+                        PatchError::InvalidSchemaMutability {
+                            attr_name: attr_name.to_string(),
+                            mutability: sub_def.mutability.clone(),
+                        }
                     })?;
-                let existing_value_sub_attr = if at_least_as_strict(parent_mutability, mutability) {
-                    None
-                } else {
-                    sub_attr
-                };
+                let existing_value_sub_attr =
+                    if at_least_as_strict(parent_mutability, sub_mutability) {
+                        None
+                    } else {
+                        sub_attr
+                    };
                 (
-                    stricter(parent_mutability, mutability),
+                    stricter(parent_mutability, sub_mutability),
                     existing_value_sub_attr,
                 )
             }
-            None => (mutability, sub_attr),
+            // The sub-attribute isn't declared in the schema at all -- there's no child
+            // mutability to weigh against the parent's, so the parent's own mutability
+            // (and its own existing-value scope) governs outright. See this function's
+            // own doc comment for why this can't just fall through to Ok(()).
+            None => (parent_mutability, None),
         },
     };
     match mutability {
@@ -1611,6 +1636,84 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, PatchError::ImmutableOrReadOnly("badge".to_string()));
+    }
+
+    #[test]
+    fn check_mutability_cascades_a_readonly_parent_to_an_entirely_undeclared_sub_attribute() {
+        // Second confirmation-pass regression (GitHub issue #12): `find_attribute(schema,
+        // attr_name, sub_attr)` returns `None` not only when the sub-attribute is declared
+        // but unmarked -- also when it isn't declared in `sub_attributes` at all. The
+        // original cascade only ran once that combined lookup succeeded, so an entirely
+        // undeclared sub-attribute name (one the schema author never enumerated, not even
+        // with a looser mutability) fell through check_mutability's "can't classify what
+        // this schema doesn't know about" early-return and bypassed the readOnly parent
+        // completely -- a strictly worse bypass than the unmarked-sub-attribute one, since
+        // it doesn't even require the schema to declare the sub-attribute at all.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "profile": {"level": "user"},
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("profile.completelyUndeclared"),
+                Some(json!("admin")),
+            )],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("profile".to_string()));
+    }
+
+    #[test]
+    fn schema_rejects_replace_targeting_an_entirely_undeclared_groups_sub_attribute() {
+        // Same regression as above, against this crate's own shipped, live schema --
+        // not a synthetic one. `User.groups` is readOnly (RFC 7643 4.1.5); `primary` is
+        // never declared among its sub_attributes (only value/$ref/display/type are).
+        // Before this fix, a client could bypass groups' readOnly protection entirely
+        // just by inventing any sub-attribute name the schema doesn't enumerate --
+        // `groups[value eq "g-1"].primary` sailed straight through, live, against
+        // `crate::user::user_schema()` as shipped.
+        let mut resource = user_with_emails();
+        resource["groups"] = json!([{"value": "g-1", "display": "Admins"}]);
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"groups[value eq "g-1"].primary"#),
+                Some(json!(true)),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("groups".to_string()));
+    }
+
+    #[test]
+    fn check_mutability_still_returns_ok_when_the_top_level_attribute_is_entirely_unmodeled() {
+        // The "can't classify what this schema doesn't know about" fallback must still
+        // apply when the *top-level* attribute itself isn't in the schema at all (e.g. an
+        // extension attribute the caller didn't merge in) -- only an undeclared
+        // *sub*-attribute of an otherwise-known parent should cascade the parent's
+        // mutability; a genuinely unknown parent still has nothing to cascade from.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+            "id": "u-1",
+            "userName": "bjensen",
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some("someUnmodeledExtensionAttribute.nested"),
+                Some(json!("x")),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["someUnmodeledExtensionAttribute"]["nested"], "x");
     }
 
     #[test]
