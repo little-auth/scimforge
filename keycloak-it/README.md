@@ -156,6 +156,77 @@ distinguish "deserializing an untrusted client request" from "deserializing your
 already-validated stored resource" from inside a generic `Deserialize` impl; that context
 is inherently the caller's to supply.
 
+## `de.captaingoldfish:scim-sdk-client` vs. `scimforge` -- interop findings (little-auth/keycloak-scim-client)
+
+[little-auth/keycloak-scim-client](https://github.com/little-auth/keycloak-scim-client) is a
+second, separate Keycloak SCIM plugin -- not exercised by this harness, which targets
+`mitodl/keycloak-scim` above -- built specifically to push to `scimforge`-based targets; it
+reuses this repo's own `keycloak-it/` as its conformance target rather than standing up a new
+one. It's built on a newer `de.captaingoldfish:scim-sdk-client` **1.34.0** (vs.
+`mitodl/keycloak-scim`'s 1.25.1 above), and its `active`-flag PATCH path uses a different SDK
+call than mitodl's. `ScimTargetClient.setActive()` (pinned commit
+[`c3bbb226329bdaf493629233af845b5dbb2125b9`](https://github.com/little-auth/keycloak-scim-client/blob/c3bbb226329bdaf493629233af845b5dbb2125b9/src/main/java/com/littleauth/keycloak/scim/client/ScimTargetClient.java#L97-L118),
+`ScimTargetClient.java:97-118`) builds its PATCH op as:
+
+```java
+requestBuilder.patch(User.class, USERS_ENDPOINT, scimId)
+    .addOperation()
+    .path("active")
+    .op(PatchOp.REPLACE)
+    .valueNode(BooleanNode.valueOf(active))
+    .build()
+```
+
+the SDK's `.valueNode(JsonNode)` overload, passed a real Jackson `BooleanNode` -- not mitodl's
+`.value(String)` overload plus `Boolean#toString()`. That was a deliberate choice in
+`keycloak-scim-client` specifically to avoid the string-coercion behavior documented above.
+
+### Does SCIM-SDK#968 manifest?
+
+[Captain-P-Goldfish/SCIM-SDK#968](https://github.com/Captain-P-Goldfish/SCIM-SDK/issues/968)
+reports that `scim-sdk-client` wraps path-based scalar PATCH values in a JSON array
+(`"value":[true]` instead of `"value":true`), RFC 7644 §3.5.2 non-compliant, still open as of
+2026-08-13. Findings here, by evidence tier -- deliberately not a single yes/no, since the two
+plugins exercise different SDK versions and different builder overloads:
+
+- **Live-captured, for `mitodl/keycloak-scim`'s call path only.** This harness's own live run
+  (above) captured `scim-sdk-client` **1.25.1**'s `.value(String)` overload sending
+  `{"path":"active","value":"false"}` over the wire -- a bare scalar, not an array. #968 does
+  **not** manifest for that specific call path and SDK version. That's the only live wire
+  evidence either project has for this question so far.
+- **Not live-captured for `keycloak-scim-client`'s own call path.** `ScimTargetClient`'s
+  `.valueNode(BooleanNode.valueOf(active))` call -- **1.34.0**, a different overload and a
+  newer SDK version than the point above -- is proven only at the unit level today:
+  `ScimTargetClientTest.setActiveSendsPatchWithNativeBooleanNodeWhenSupported`
+  (`ScimTargetClientTest.java:86`) asserts the code *calls*
+  `.valueNode(any(BooleanNode.class))` with a mocked `PatchBuilder`, which proves
+  `keycloak-scim-client` builds the request correctly on its side but cannot see what the SDK
+  actually serializes onto the wire -- exactly the internal behavior #968 is about. That
+  repo's own live conformance harness (`conformance/`) has proven `POST /Users` and discovery
+  traffic end-to-end against a real Keycloak + real resolved vault credential, but has not yet
+  exercised the deprovision/PATCH path with a captured wire body. So: **unconfirmed, not
+  cleared**, for this specific call path and version.
+- **`scimforge`'s own PATCH handling isn't the risk surface here either way.** If #968 did
+  manifest, an inbound `"value":[true]` is what `scimforge` would receive where it expects
+  `"value":true`. `apply_patch_with_schema`'s type coercion (described above) only coerces a
+  JSON *string* toward the declared type -- it does not unwrap a single-element array. A
+  RFC-literal PATCH engine merging `[true]` untyped into a `boolean`-typed attribute would
+  reject it (type mismatch) or store the array literally, not silently succeed with the wrong
+  scalar value. Worth a dedicated `scimforge`-side regression test if a live capture ever does
+  reproduce #968 against either plugin's call path -- not added speculatively against a bug
+  that hasn't been observed on the wire.
+
+**What's still open:** a live wire capture of `keycloak-scim-client`'s own `.valueNode()` PATCH
+path against a real `scimforge`/`keycloak-it` target -- driving a real Keycloak deprovision
+(disable-user) event through to a captured `/__captured` PATCH body -- would give live-verified
+evidence for the actual call path that plugin ships, rather than the source-read-plus-unit-test
+tier this section currently has for it. Not attempted here: out of scope for this
+documentation-only pass (tracked as
+[little-auth/keycloak-scim-client#5](https://github.com/little-auth/keycloak-scim-client/issues/5),
+which this section resolves by documenting the current, honestly-scoped state -- it does not
+claim the live gap itself is closed), and the existing live evidence already conclusively
+answers the narrower question it covers (a different overload, an older SDK version).
+
 ## Running the live conformance test
 
 Requires Docker.
