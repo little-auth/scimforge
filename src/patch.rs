@@ -1717,6 +1717,33 @@ mod tests {
     }
 
     #[test]
+    fn check_mutability_still_allows_an_undeclared_sub_attribute_under_a_readwrite_parent() {
+        // The undeclared-sub-attribute fix must not over-tighten: it only matters once the
+        // parent's own mutability is actually stricter than RFC 7643 2.2's readWrite
+        // default. Group.members is readWrite (only its declared sub-attributes --
+        // value/$ref/display/type -- are individually immutable), so an entirely
+        // undeclared sub-attribute name under it (never enumerated by group_schema() at
+        // all) must still be writable, exactly as before this fix.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": "u-1", "type": "User", "display": "Alice"}]
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"].nickname"#),
+                Some(json!("Al")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["members"][0]["nickname"], "Al");
+    }
+
+    #[test]
     fn check_mutability_does_not_cascade_when_parent_and_sub_attribute_are_both_readwrite() {
         // Baseline: nothing stricter anywhere in the chain, nothing should be rejected.
         let resource = json!({
