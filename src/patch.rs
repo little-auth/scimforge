@@ -3330,4 +3330,96 @@ mod tests {
             user_emails
         ));
     }
+
+    /// A synthetic schema for a multi-valued complex `items` attribute whose three
+    /// sub-attributes' mutability is independently configurable -- proves
+    /// `multivalued_complex_attr_has_a_protected_sub_attr`'s `.any()` doesn't
+    /// accidentally depend on *which* sub-attribute (or its position) is protected,
+    /// only on whether one is.
+    fn schema_with_mixed_protection(
+        value_mutability: &str,
+        type_mutability: &str,
+        display_mutability: &str,
+    ) -> SchemaResource {
+        SchemaResource {
+            schemas: vec![crate::discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:Mixed".to_string(),
+            name: Some("Mixed".to_string()),
+            description: None,
+            attributes: vec![crate::discovery::AttributeDefinition {
+                multi_valued: true,
+                sub_attributes: vec![
+                    crate::discovery::AttributeDefinition::simple(
+                        "value",
+                        "string",
+                        "v",
+                        value_mutability,
+                    ),
+                    crate::discovery::AttributeDefinition::simple(
+                        "type",
+                        "string",
+                        "t",
+                        type_mutability,
+                    ),
+                    crate::discovery::AttributeDefinition::simple(
+                        "display",
+                        "string",
+                        "d",
+                        display_mutability,
+                    ),
+                ],
+                ..crate::discovery::AttributeDefinition::simple(
+                    "items",
+                    "complex",
+                    "items",
+                    "readWrite",
+                )
+            }],
+        }
+    }
+
+    #[test]
+    fn multivalued_complex_attr_has_a_protected_sub_attr_counts_readonly_not_just_immutable() {
+        let schema = schema_with_mixed_protection("readWrite", "readWrite", "readOnly");
+        let attr_def = crate::discovery::find_attribute(&schema, "items", None).unwrap();
+        assert!(multivalued_complex_attr_has_a_protected_sub_attr(attr_def));
+    }
+
+    #[test]
+    fn multivalued_complex_attr_has_a_protected_sub_attr_finds_protection_anywhere_not_just_value()
+    {
+        // "type" (neither "value" nor the last sub-attribute) is the only protected
+        // one here -- the helper must not be accidentally special-casing position.
+        let schema = schema_with_mixed_protection("readWrite", "immutable", "readWrite");
+        let attr_def = crate::discovery::find_attribute(&schema, "items", None).unwrap();
+        assert!(multivalued_complex_attr_has_a_protected_sub_attr(attr_def));
+    }
+
+    #[test]
+    fn no_path_replace_rejects_ambiguity_when_only_a_non_value_middle_sub_attr_is_protected() {
+        // End-to-end companion to the unit test above: proves the full PATCH path
+        // (not just the boolean helper in isolation) still rejects ambiguous
+        // correlation when the protected sub-attribute is neither "value" itself nor
+        // the entry's last key.
+        let schema = schema_with_mixed_protection("readWrite", "immutable", "readWrite");
+        let resource = json!({
+            "schemas": ["urn:test:Mixed"],
+            "id": "m-1",
+            "items": [
+                {"value": "dup", "type": "alpha"},
+                {"value": "dup", "type": "beta"}
+            ]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({"items": [{"value": "dup", "type": "MALLORY"}]})),
+            )],
+            &schema,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
+    }
 }
