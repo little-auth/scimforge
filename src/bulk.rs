@@ -218,7 +218,7 @@ pub fn check_limits(
 
 const BULK_ID_PREFIX: &str = "bulkId:";
 
-/// Recursion depth limit shared by [`find_bulk_id_refs`] and [`BulkIdResolver::substitute`]
+/// Recursion depth limit shared by `find_bulk_id_refs` and [`BulkIdResolver::substitute`]
 /// -- both walk an operation's attacker-controlled `data` tree, which RFC 7644 places no
 /// nesting bound on. Mirrors [`crate::filter::MAX_DEPTH`]'s same value and same rationale.
 pub const MAX_DEPTH: usize = 32;
