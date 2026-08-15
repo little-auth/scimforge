@@ -220,17 +220,24 @@ fn mutability_rank(m: Mutability) -> u8 {
     }
 }
 
+/// Whether `a` is at least as strict as `b`, by [`mutability_rank`] -- i.e. whether `a`
+/// is the side that "wins" when both apply to the same write. [`stricter`] returns the
+/// resulting [`Mutability`]; this returns *which side* that came from, since
+/// [`check_mutability`] needs both: which attribute (a sub-attribute or its parent) is
+/// actually the reason a write is protected also decides which attribute's existing
+/// value the immutable add-exception must consult (see [`check_mutability`]'s own doc
+/// comment on `existing_value_sub_attr`).
+fn at_least_as_strict(a: Mutability, b: Mutability) -> bool {
+    mutability_rank(a) >= mutability_rank(b)
+}
+
 /// The effective mutability when two apply to the same write: the stricter of the two,
 /// by [`mutability_rank`]. Used by [`check_mutability`] to combine a sub-attribute's own
 /// mutability with its parent's, so a readOnly/immutable parent's protection is a floor a
 /// looser sub-attribute can never lower -- never a ceiling that loosens an
 /// explicitly-stricter sub-attribute down to a looser parent's (see GitHub issue #12).
 fn stricter(a: Mutability, b: Mutability) -> Mutability {
-    if mutability_rank(a) >= mutability_rank(b) {
-        a
-    } else {
-        b
-    }
+    if at_least_as_strict(a, b) { a } else { b }
 }
 
 /// RFC 7644 §3.5.2: "a client MUST NOT modify an attribute that has mutability
@@ -253,6 +260,23 @@ fn stricter(a: Mutability, b: Mutability) -> Mutability {
 /// hand-assemble/merge a schema (e.g. for an extension), and nothing stopped a future
 /// schema -- shipped or caller-supplied -- from reopening this exact gap. See GitHub
 /// issue #12.
+///
+/// Cascading *which* mutability applies isn't sufficient on its own: the immutable
+/// add-exception's "had no previous value" check (below, via
+/// [`attribute_has_existing_value`]) must also be scoped to whichever attribute is
+/// actually doing the protecting. `existing_value_sub_attr` is `sub_attr` unchanged when
+/// the sub-attribute's own mutability is at least as strict as its parent's (preserving
+/// this crate's established per-sub-attribute precision, e.g. `Group.members[].display`
+/// -- an entry that already exists but never had `display` set may still receive it), or
+/// `None` (the parent as a whole) when the parent's mutability is what cascaded in.
+/// Getting this wrong doesn't just misclassify severity: cascading `Immutable` from the
+/// parent while still asking whether *this never-before-set sub-attribute* has a
+/// previous value let an attacker add previously-unset fields to an already-existing
+/// immutable complex value one field at a time, forever, since each individual field
+/// really was unset in isolation -- the parent's own existing value never entered the
+/// check at all (found by this fix's own adversarial confirmation pass; regression
+/// tests: `check_mutability_rejects_add_to_a_cascaded_immutable_sub_attribute_when_the_
+/// entry_already_exists` and its `_parent_already_has_a_value` sibling).
 fn check_mutability(
     schema: &SchemaResource,
     resource: &Value,
@@ -272,23 +296,32 @@ fn check_mutability(
             mutability: attr_def.mutability.clone(),
         }
     })?;
-    let mutability = match sub_attr {
-        None => mutability,
+    let (mutability, existing_value_sub_attr) = match sub_attr {
+        None => (mutability, sub_attr),
         Some(_) => match discovery::find_attribute(schema, attr_name, None) {
             // Structurally always `Some` here: `find_attribute` only ever resolves a
             // sub-attribute by first resolving its parent by `attr_name` (see its own
             // doc), so `attr_def` having resolved above already implies this does too.
-            // Falling back to the sub-attribute's own mutability rather than a `panic!`/
-            // `.expect` keeps this function total even if that invariant is ever violated.
+            // Falling back to the sub-attribute's own mutability/scope rather than a
+            // `panic!`/`.expect` keeps this function total even if that invariant is
+            // ever violated.
             Some(parent_def) => {
                 let parent_mutability = Mutability::from_rfc_str(&parent_def.mutability)
                     .ok_or_else(|| PatchError::InvalidSchemaMutability {
                         attr_name: attr_name.to_string(),
                         mutability: parent_def.mutability.clone(),
                     })?;
-                stricter(parent_mutability, mutability)
+                let existing_value_sub_attr = if at_least_as_strict(parent_mutability, mutability) {
+                    None
+                } else {
+                    sub_attr
+                };
+                (
+                    stricter(parent_mutability, mutability),
+                    existing_value_sub_attr,
+                )
             }
-            None => mutability,
+            None => (mutability, sub_attr),
         },
     };
     match mutability {
@@ -298,7 +331,7 @@ fn check_mutability(
                 || attribute_has_existing_value(
                     resource,
                     attr_name,
-                    sub_attr,
+                    existing_value_sub_attr,
                     value_filter,
                     schema,
                 );
@@ -1429,6 +1462,27 @@ mod tests {
                         "ReadOnly", // wrong case -- RFC 7643 tokens are exact-case.
                     )
                 },
+                discovery::AttributeDefinition {
+                    // Single-valued complex, immutable at the top level; `nickname` is
+                    // left at the readWrite default -- reached via a plain dotted path
+                    // (unlike `widgets`, which is only reachable via a bracket filter,
+                    // and whose matched entry -- by construction of how a bracket-filter
+                    // `add` resolves -- always already exists). This is what exercises
+                    // the immutable add-exception's "had no previous value" precision on
+                    // a path where a genuinely brand-new value is actually reachable.
+                    sub_attributes: vec![discovery::AttributeDefinition::simple(
+                        "nickname",
+                        "string",
+                        "Left unmarked (readWrite) despite badge being immutable.",
+                        "readWrite",
+                    )],
+                    ..discovery::AttributeDefinition::simple(
+                        "badge",
+                        "complex",
+                        "An immutable single-valued complex attribute.",
+                        "immutable",
+                    )
+                },
             ],
         }
     }
@@ -1482,19 +1536,26 @@ mod tests {
     }
 
     #[test]
-    fn check_mutability_still_allows_add_to_a_cascaded_immutable_sub_attribute_with_no_existing_value()
+    fn check_mutability_rejects_add_to_a_cascaded_immutable_sub_attribute_when_the_entry_already_exists()
      {
-        // The cascade must preserve immutable's own add-exception (RFC 7644 3.5.2: "MAY
-        // 'add' a value to an 'immutable' attribute if the attribute had no previous
-        // value") -- it should compute an effective mutability of Immutable, not
-        // over-tighten to ReadOnly, for an unmarked sub-attribute under an immutable
-        // parent.
+        // Confirmation-pass regression (GitHub issue #12): cascading `widgets`'s
+        // immutable mutability down to unmarked `label` isn't enough on its own -- the
+        // immutable add-exception's "had no previous value" check must also be scoped to
+        // whichever attribute is actually being protected. The `w-1` entry already
+        // exists (that's *why* this path resolves to an existing entry at all -- a
+        // bracket-filtered add can only ever match an existing entry, see
+        // apply_add_or_replace's NoMatchingValue handling), so per the cascaded
+        // Immutable protection, `widgets` already has a previous value here and no
+        // further field of this entry may be added, even one -- like `label` -- that was
+        // itself never set. Before this was fixed, `attribute_has_existing_value` was
+        // still asked about `label`'s own (unset) value, not `widgets`'s, and let this
+        // through.
         let resource = json!({
             "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
             "id": "w-1",
             "widgets": [{"value": "w-1"}],
         });
-        let result = apply_patch_with_schema(
+        let err = apply_patch_with_schema(
             &resource,
             &[op(
                 PatchOp::Add,
@@ -1503,8 +1564,53 @@ mod tests {
             )],
             &schema_with_unmarked_sub_attrs_under_stricter_parents(),
         )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("widgets".to_string()));
+    }
+
+    #[test]
+    fn check_mutability_still_allows_add_to_a_cascaded_immutable_sub_attribute_when_the_parent_is_genuinely_absent()
+     {
+        // The cascade must still preserve immutable's own add-exception (RFC 7644
+        // 3.5.2: "MAY 'add' a value to an 'immutable' attribute if the attribute had no
+        // previous value") for a genuinely first-time set -- it should compute an
+        // effective mutability of Immutable, not over-tighten to ReadOnly, for an
+        // unmarked sub-attribute under an immutable parent. `badge` (reached via a plain
+        // dotted path, not a bracket filter) is entirely absent from the resource, so
+        // there is no previous value for `badge` -- the parent whose mutability actually
+        // governs this write, once cascaded -- to protect.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Add, Some("badge.nickname"), Some(json!("Ace")))],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
         .unwrap();
-        assert_eq!(result["widgets"][0]["label"], "new");
+        assert_eq!(result["badge"]["nickname"], "Ace");
+    }
+
+    #[test]
+    fn check_mutability_rejects_add_to_a_cascaded_immutable_sub_attribute_when_the_parent_already_has_a_value()
+     {
+        // Same confirmation-pass regression as the widgets case above, via the dotted-path
+        // shape: `badge` already exists (with no `nickname` set yet), so per the cascaded
+        // Immutable protection `badge` already has a previous value and `nickname` -- even
+        // though it was itself never set -- may not be added.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "badge": {},
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Add, Some("badge.nickname"), Some(json!("Ace")))],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("badge".to_string()));
     }
 
     #[test]
