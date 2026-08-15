@@ -207,6 +207,32 @@ fn apply_one(
     }
 }
 
+/// Ranks RFC 7643 §2.2 mutability tokens by how much they restrict a PATCH write:
+/// `ReadOnly` is strictest (never writable), `Immutable` next (writable exactly once, via
+/// `add`, only while unset), and `ReadWrite`/`WriteOnly` are the least strict -- there's no
+/// meaningful ordering between those last two since [`check_mutability`]'s own match on
+/// [`Mutability`] treats them identically (`Ok(())` unconditionally regardless of which).
+fn mutability_rank(m: Mutability) -> u8 {
+    match m {
+        Mutability::ReadOnly => 2,
+        Mutability::Immutable => 1,
+        Mutability::ReadWrite | Mutability::WriteOnly => 0,
+    }
+}
+
+/// The effective mutability when two apply to the same write: the stricter of the two,
+/// by [`mutability_rank`]. Used by [`check_mutability`] to combine a sub-attribute's own
+/// mutability with its parent's, so a readOnly/immutable parent's protection is a floor a
+/// looser sub-attribute can never lower -- never a ceiling that loosens an
+/// explicitly-stricter sub-attribute down to a looser parent's (see GitHub issue #12).
+fn stricter(a: Mutability, b: Mutability) -> Mutability {
+    if mutability_rank(a) >= mutability_rank(b) {
+        a
+    } else {
+        b
+    }
+}
+
 /// RFC 7644 §3.5.2: "a client MUST NOT modify an attribute that has mutability
 /// 'readOnly' or 'immutable'... \[but\] MAY 'add' a value to an 'immutable' attribute if
 /// the attribute had no previous value" -- quoted verbatim since the "add exception"
@@ -214,6 +240,19 @@ fn apply_one(
 /// when no previous value exists). `replace`/`remove` on an immutable attribute are
 /// rejected unconditionally regardless of `value_filter`, so `has_existing` below is only
 /// ever actually evaluated for `op == PatchOp::Add`.
+///
+/// For a sub-attribute path (`sub_attr: Some`), the mutability actually enforced is the
+/// stricter (via [`stricter`]) of the sub-attribute's own and its parent complex/
+/// multi-valued attribute's own -- [`discovery::find_attribute`] alone only ever returns
+/// the sub-attribute's own definition, so without this, a readOnly/immutable parent (e.g.
+/// `User.groups`) gave no protection at all to a sub-attribute the schema left unmarked
+/// (defaulting to readWrite per RFC 7643 §2.2), regardless of the parent's own mutability.
+/// This crate's own shipped schemas don't have a live gap here (every readOnly/immutable
+/// complex attribute they declare has every sub-attribute hand-annotated to match), but
+/// [`apply_patch_with_schema`]'s own doc comment explicitly invites a caller to
+/// hand-assemble/merge a schema (e.g. for an extension), and nothing stopped a future
+/// schema -- shipped or caller-supplied -- from reopening this exact gap. See GitHub
+/// issue #12.
 fn check_mutability(
     schema: &SchemaResource,
     resource: &Value,
@@ -233,6 +272,25 @@ fn check_mutability(
             mutability: attr_def.mutability.clone(),
         }
     })?;
+    let mutability = match sub_attr {
+        None => mutability,
+        Some(_) => match discovery::find_attribute(schema, attr_name, None) {
+            // Structurally always `Some` here: `find_attribute` only ever resolves a
+            // sub-attribute by first resolving its parent by `attr_name` (see its own
+            // doc), so `attr_def` having resolved above already implies this does too.
+            // Falling back to the sub-attribute's own mutability rather than a `panic!`/
+            // `.expect` keeps this function total even if that invariant is ever violated.
+            Some(parent_def) => {
+                let parent_mutability = Mutability::from_rfc_str(&parent_def.mutability)
+                    .ok_or_else(|| PatchError::InvalidSchemaMutability {
+                        attr_name: attr_name.to_string(),
+                        mutability: parent_def.mutability.clone(),
+                    })?;
+                stricter(parent_mutability, mutability)
+            }
+            None => mutability,
+        },
+    };
     match mutability {
         Mutability::ReadOnly => Err(PatchError::ImmutableOrReadOnly(attr_name.to_string())),
         Mutability::Immutable => {
@@ -1232,6 +1290,244 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PatchError::ImmutableOrReadOnly(_)));
+    }
+
+    /// A synthetic schema exercising the cascade gap GitHub issue #12 describes, which
+    /// none of this crate's own shipped schemas (user/group/enterprise-user) actually
+    /// have: every readOnly/immutable complex attribute they declare has all of its
+    /// sub-attributes hand-annotated readOnly/immutable too, so there's no live example
+    /// of a sub-attribute *left at the readWrite default* under a stricter parent. This
+    /// is exactly the shape `apply_patch_with_schema`'s own doc comment invites a caller
+    /// to hand-assemble (e.g. merging in an extension schema), so it's the realistic
+    /// stand-in for "future schema that reopens the cascade bug."
+    fn schema_with_unmarked_sub_attrs_under_stricter_parents() -> SchemaResource {
+        SchemaResource {
+            schemas: vec![discovery::SCHEMA_SCHEMA_URI.to_string()],
+            id: "urn:test:params:scim:schemas:extension:cascade:2.0:Widget".to_string(),
+            name: Some("Widget".to_string()),
+            description: None,
+            attributes: vec![
+                discovery::AttributeDefinition {
+                    // Single-valued complex, readOnly at the top level; `level` is left
+                    // at the readWrite default -- the shape a schema author forgets to
+                    // annotate.
+                    sub_attributes: vec![discovery::AttributeDefinition::simple(
+                        "level",
+                        "string",
+                        "Left unmarked (readWrite) despite profile being readOnly.",
+                        "readWrite",
+                    )],
+                    ..discovery::AttributeDefinition::simple(
+                        "profile",
+                        "complex",
+                        "A readOnly single-valued complex attribute.",
+                        "readOnly",
+                    )
+                },
+                discovery::AttributeDefinition {
+                    // Multi-valued complex, immutable at the top level; `label` is left
+                    // at the readWrite default the same way.
+                    multi_valued: true,
+                    sub_attributes: vec![
+                        discovery::AttributeDefinition::simple(
+                            "value",
+                            "string",
+                            "Correlates entries.",
+                            "readWrite",
+                        ),
+                        discovery::AttributeDefinition::simple(
+                            "label",
+                            "string",
+                            "Left unmarked (readWrite) despite widgets being immutable.",
+                            "readWrite",
+                        ),
+                    ],
+                    ..discovery::AttributeDefinition::simple(
+                        "widgets",
+                        "complex",
+                        "An immutable multi-valued complex attribute.",
+                        "immutable",
+                    )
+                },
+                discovery::AttributeDefinition {
+                    // Single-valued complex, ordinary readWrite parent -- the baseline
+                    // "nothing to cascade" case, must stay allowed.
+                    sub_attributes: vec![discovery::AttributeDefinition::simple(
+                        "note",
+                        "string",
+                        "An ordinary readWrite sub-attribute of a readWrite parent.",
+                        "readWrite",
+                    )],
+                    ..discovery::AttributeDefinition::simple(
+                        "settings",
+                        "complex",
+                        "An ordinary readWrite single-valued complex attribute.",
+                        "readWrite",
+                    )
+                },
+                discovery::AttributeDefinition {
+                    // Malformed mutability string on the *parent*, well-formed on the
+                    // child -- previously never inspected on a sub-attribute path.
+                    sub_attributes: vec![discovery::AttributeDefinition::simple(
+                        "detail",
+                        "string",
+                        "A well-formed sub-attribute under a malformed parent.",
+                        "readWrite",
+                    )],
+                    ..discovery::AttributeDefinition::simple(
+                        "broken",
+                        "complex",
+                        "A single-valued complex attribute with a typo'd mutability.",
+                        "ReadOnly", // wrong case -- RFC 7643 tokens are exact-case.
+                    )
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn check_mutability_cascades_a_readonly_parent_to_an_unmarked_sub_attribute() {
+        // The core regression this ticket exists for: `profile` is readOnly at the top
+        // level, but `profile.level` was left at the readWrite default. Before the fix,
+        // find_attribute(schema, "profile", Some("level")) resolved only `level`'s own
+        // (readWrite) mutability, so this replace sailed straight through.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "profile": {"level": "user"},
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("profile.level"),
+                Some(json!("admin")),
+            )],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("profile".to_string()));
+    }
+
+    #[test]
+    fn check_mutability_cascades_an_immutable_parent_to_an_unmarked_sub_attribute_on_replace() {
+        // Same gap via a multi-valued complex attribute and a bracket-filtered path:
+        // `widgets` is immutable, `widgets[].label` was left at the readWrite default.
+        // `replace` on an immutable attribute is rejected unconditionally regardless of
+        // whether a previous value exists (see check_mutability's own doc comment).
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "widgets": [{"value": "w-1", "label": "old"}],
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"widgets[value eq "w-1"].label"#),
+                Some(json!("new")),
+            )],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("widgets".to_string()));
+    }
+
+    #[test]
+    fn check_mutability_still_allows_add_to_a_cascaded_immutable_sub_attribute_with_no_existing_value()
+     {
+        // The cascade must preserve immutable's own add-exception (RFC 7644 3.5.2: "MAY
+        // 'add' a value to an 'immutable' attribute if the attribute had no previous
+        // value") -- it should compute an effective mutability of Immutable, not
+        // over-tighten to ReadOnly, for an unmarked sub-attribute under an immutable
+        // parent.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "widgets": [{"value": "w-1"}],
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Add,
+                Some(r#"widgets[value eq "w-1"].label"#),
+                Some(json!("new")),
+            )],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap();
+        assert_eq!(result["widgets"][0]["label"], "new");
+    }
+
+    #[test]
+    fn check_mutability_does_not_cascade_when_parent_and_sub_attribute_are_both_readwrite() {
+        // Baseline: nothing stricter anywhere in the chain, nothing should be rejected.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "settings": {"note": "old"},
+        });
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("settings.note"),
+                Some(json!("new")),
+            )],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap();
+        assert_eq!(result["settings"]["note"], "new");
+    }
+
+    #[test]
+    fn check_mutability_does_not_cascade_a_stricter_sub_attribute_down_to_a_looser_parent() {
+        // The inverse direction must NOT happen: `members[].display` (readWrite parent,
+        // immutable sub-attribute per RFC 7643 4.2) must stay immutable -- the cascade
+        // is a floor (parent's strictness protects the child), never a ceiling that
+        // loosens an explicitly-stricter sub-attribute down to its parent's mutability.
+        let resource = json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": "g-1",
+            "displayName": "Admins",
+            "members": [{"value": "u-1", "type": "User", "display": "Alice"}]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some(r#"members[value eq "u-1"].display"#),
+                Some(json!("Mallory")),
+            )],
+            &crate::group::group_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err, PatchError::ImmutableOrReadOnly("members".to_string()));
+    }
+
+    #[test]
+    fn check_mutability_surfaces_a_malformed_parent_mutability_on_a_sub_attribute_path() {
+        // Previously, a sub-attribute path never even looked at the parent's own
+        // mutability string, so a typo there (wrong case, here) went uninspected as long
+        // as the sub-attribute's own string parsed fine. The cascade fix means this is
+        // now surfaced -- a schema-authoring bug becomes a visible InvalidSchemaMutability
+        // error rather than staying silently uninspected.
+        let resource = json!({
+            "schemas": ["urn:test:params:scim:schemas:extension:cascade:2.0:Widget"],
+            "id": "w-1",
+            "broken": {"detail": "old"},
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("broken.detail"),
+                Some(json!("new")),
+            )],
+            &schema_with_unmarked_sub_attrs_under_stricter_parents(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::InvalidSchemaMutability { .. }));
     }
 
     #[test]
