@@ -680,12 +680,22 @@ fn check_multivalued_complex_replace_mutability(
         // and skipping check_entry_immutable_sub_attrs for that entry altogether,
         // silently forging any of its immutable/readOnly sub-attributes (display,
         // $ref, type) unchecked. Every case-variant "value"-named key present is tried
-        // against find_entry_by_value: if ANY of them correlates to an existing entry,
-        // the immutability check runs against that baseline. `?` propagates immediately
-        // on the first case-variant key that finds an ambiguous existing match (see
-        // find_entry_by_value's doc comment, issue #13) rather than silently trying the
-        // next case-variant key as if this one simply hadn't matched.
-        let mut existing_entry = None;
+        // against find_entry_by_value, and EVERY one that correlates to something must
+        // agree on which existing entry that is (compared by reference identity, since
+        // they all borrow from the same `entries` slice) -- not just whichever
+        // candidate happens to be tried first. `serde_json::Map` here is a `BTreeMap`
+        // (this crate doesn't enable `preserve_order`), so iteration order is
+        // key-sorted, not insertion-order: "Value" sorts before "value" (ASCII 'V' <
+        // 'v'), meaning a naive "first successful candidate wins, stop there" loop
+        // could resolve via a *later*, unambiguous candidate key without ever
+        // evaluating an *earlier*, genuinely ambiguous one -- letting a two-differently
+        // -cased-"value"-keys entry dodge the ambiguity check entirely (issue #13
+        // security-audit follow-up). This mirrors the same reasoning
+        // check_entry_immutable_sub_attrs already applies to decoy sub-attribute keys:
+        // an entry that doesn't unambiguously agree on its own correlated identity
+        // across every case-variant key present is itself adversarial-shaped input, not
+        // something safe to resolve with a single arbitrary tie-break.
+        let mut existing_entry: Option<&Value> = None;
         for (_, new_key) in new_obj
             .iter()
             .filter(|(k, _)| k.eq_ignore_ascii_case("value"))
@@ -694,8 +704,15 @@ fn check_multivalued_complex_replace_mutability(
                 break;
             };
             if let Some(found) = find_entry_by_value(attr_name, entries, attr_def, new_key)? {
-                existing_entry = Some(found);
-                break;
+                match existing_entry {
+                    Some(prior) if !std::ptr::eq(prior, found) => {
+                        return Err(PatchError::AmbiguousEntryIdentity {
+                            attr_name: attr_name.to_string(),
+                            value: new_key.clone(),
+                        });
+                    }
+                    _ => existing_entry = Some(found),
+                }
             }
         }
         let Some(existing_entry) = existing_entry else {
@@ -3093,6 +3110,46 @@ mod tests {
                 PatchOp::Replace,
                 None,
                 Some(json!({"entries": [{"value": "Dup", "secret": "MALLORY"}]})),
+            )],
+            &entry_schema(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, PatchError::AmbiguousEntryIdentity { .. }));
+    }
+
+    #[test]
+    fn no_path_replace_rejects_decoy_cased_value_keys_that_disagree_on_which_entry_they_correlate_to()
+     {
+        // Security-audit follow-up (issue #13): a new_entry carrying two
+        // differently-cased "value"-named keys where ONE resolves unambiguously (to
+        // "elsewhere", a distinct real entry) and the OTHER is itself ambiguous ("dup",
+        // shared by two existing entries) must still be rejected -- not resolved by
+        // whichever candidate a naive "first successful key wins" loop happens to try
+        // first. serde_json's Map here is a BTreeMap (no preserve_order), so "Value"
+        // (uppercase) sorts before "value" (lowercase) in iteration order; a loop that
+        // stops at the first candidate that finds ANY match would resolve via "Value"
+        // (successfully correlating to "elsewhere") and never even evaluate "value"
+        // (the genuinely ambiguous "dup"), silently dodging the ambiguity check this
+        // ticket exists to add.
+        let resource = json!({
+            "schemas": ["urn:test:Entry"],
+            "id": "e-1",
+            "entries": [
+                {"value": "dup", "secret": "s1"},
+                {"value": "dup", "secret": "s2"},
+                {"value": "elsewhere", "secret": "real-secret"}
+            ]
+        });
+        let err = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                None,
+                Some(json!({
+                    "entries": [
+                        {"value": "dup", "Value": "elsewhere", "secret": "real-secret"}
+                    ]
+                })),
             )],
             &entry_schema(),
         )
