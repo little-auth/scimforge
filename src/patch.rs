@@ -1231,6 +1231,54 @@ mod tests {
     // --- Schema-driven mutability (apply_patch_with_schema) ---
 
     #[test]
+    fn stricter_prefers_readonly_over_immutable_regardless_of_argument_order() {
+        assert_eq!(
+            stricter(Mutability::ReadOnly, Mutability::Immutable),
+            Mutability::ReadOnly
+        );
+        assert_eq!(
+            stricter(Mutability::Immutable, Mutability::ReadOnly),
+            Mutability::ReadOnly
+        );
+    }
+
+    #[test]
+    fn stricter_prefers_immutable_over_readwrite_and_writeonly_regardless_of_argument_order() {
+        assert_eq!(
+            stricter(Mutability::Immutable, Mutability::ReadWrite),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            stricter(Mutability::ReadWrite, Mutability::Immutable),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            stricter(Mutability::Immutable, Mutability::WriteOnly),
+            Mutability::Immutable
+        );
+        assert_eq!(
+            stricter(Mutability::WriteOnly, Mutability::Immutable),
+            Mutability::Immutable
+        );
+    }
+
+    #[test]
+    fn stricter_treats_readwrite_and_writeonly_as_equally_unrestrictive() {
+        // Neither is stricter than the other (check_mutability's own match on Mutability
+        // treats both identically), so `stricter` just returns whichever argument came
+        // first when ranks tie -- verified both ways so a future rank change that breaks
+        // this tie-break symmetry doesn't sneak past silently.
+        assert_eq!(
+            stricter(Mutability::ReadWrite, Mutability::WriteOnly),
+            Mutability::ReadWrite
+        );
+        assert_eq!(
+            stricter(Mutability::WriteOnly, Mutability::ReadWrite),
+            Mutability::WriteOnly
+        );
+    }
+
+    #[test]
     fn schema_rejects_replace_targeting_a_readonly_attribute() {
         // User.groups is readOnly per RFC 7643 4.1.5 -- not one of the three universally
         // protected common attributes, only catchable via the schema-driven check.
