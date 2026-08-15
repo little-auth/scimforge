@@ -193,10 +193,8 @@ silently mis-typing it.
 
 ## License
 
+Copyright (c) 2026 Mario Đanić
+
 Licensed under either of
 [Apache License, Version 2.0](https://github.com/little-auth/scimforge/blob/main/LICENSE-APACHE)
 or [MIT license](https://github.com/little-auth/scimforge/blob/main/LICENSE-MIT) at your option.
-(Relative links here would break once this README doubles as the crate's rustdoc front
-page via `#![doc = include_str!(...)]` -- rustdoc doesn't check plain markdown hyperlinks
-to local files the way it checks intra-doc `[`Type`]` links, so a relative path here would
-silently 404 on docs.rs without CI ever catching it.)
