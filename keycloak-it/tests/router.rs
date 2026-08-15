@@ -2,10 +2,11 @@
 //! no live Keycloak needed. This is the local TDD surface for "does a real Keycloak
 //! SCIM-plugin request actually get accepted and parsed correctly end to end" (GitHub
 //! issue #1): the request bodies here are shaped exactly as researched from
-//! mitodl/keycloak-scim's source (`UserAdapter.toSCIM()`/`toPatchBuilder()`, pinned
-//! commit eec8ecd14971886f0d00f3dc688b587c3002f252), not guessed at. The actual live
-//! Keycloak run (`tests/keycloak_conformance.rs`, `#[ignore]`d) is the real-world trial;
-//! this file is what makes that trial's outcome predictable ahead of time.
+//! `little-auth/keycloak-scim-client`'s source (`KeycloakUserMapper.toScimUser()`,
+//! `ScimTargetClient.createUser()`/`setActive()`, commit 845386c on `main`), not guessed
+//! at. The actual live Keycloak run (`tests/keycloak_conformance.rs`, `#[ignore]`d) is the
+//! real-world trial; this file is what makes that trial's outcome predictable ahead of
+//! time.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -43,19 +44,19 @@ fn json_body(value: &Value) -> Body {
     Body::from(serde_json::to_vec(value).unwrap())
 }
 
-/// mitodl/keycloak-scim's `UserAdapter.toSCIM()` builds a create body with exactly these
-/// fields populated -- externalId, userName, id (Keycloak's own bookkeeping, not a trust
-/// signal -- see users::create's doc comment), displayName, name.{givenName,familyName},
-/// a single-entry emails array with no `type`, and active.
+/// `little-auth/keycloak-scim-client`'s `KeycloakUserMapper.toScimUser()` builds a create
+/// body with exactly these fields populated -- externalId (the Keycloak user id, never
+/// `id` -- the mapper deliberately never sets `id` at all, to keep RFC 7643's
+/// client-supplied/server-assigned distinction unambiguous), userName,
+/// name.{givenName,familyName} (only when at least one is present), a single-entry emails
+/// array with `primary: true` and no `type`, and active.
 fn keycloak_style_create_body() -> Value {
     json!({
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
         "externalId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
         "userName": "bjensen",
-        "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-        "displayName": "Babs Jensen",
         "name": {"givenName": "Babs", "familyName": "Jensen"},
-        "emails": [{"value": "bjensen@example.com"}],
+        "emails": [{"value": "bjensen@example.com", "primary": true}],
         "active": true
     })
 }
@@ -73,16 +74,45 @@ async fn creates_a_user_from_a_keycloak_plugin_shaped_body() {
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(body["userName"], "bjensen");
     assert_eq!(body["active"], true);
-    // The server-generated id must never equal the client-supplied one from the request
-    // body above -- proving users::create's overwrite (see its doc comment) actually ran,
-    // not just that the field happens to be present.
-    assert_ne!(body["id"], json!("f47ac10b-58cc-4372-a567-0e02b2c3d479"));
+    assert_eq!(
+        body["externalId"],
+        "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    );
+    // The server always assigns its own id -- proving users::create's server-generated-id
+    // path actually ran, not just that some id field happens to be present.
+    assert!(body["id"].as_str().is_some_and(|id| !id.is_empty()));
+    assert_ne!(body["id"], body["externalId"]);
     assert!(
         body["meta"]["location"]
             .as_str()
             .unwrap()
             .starts_with("/Users/")
     );
+}
+
+#[tokio::test]
+async fn create_always_assigns_a_server_generated_id_even_if_the_client_supplies_one() {
+    // RFC 7643 3.1: id "is always issued by the service provider and MUST NOT be
+    // specified by the client." Regression coverage for CVE-2025-41115's root-cause lesson
+    // (never trust a client-supplied identifier as if it were server-assigned) -- kept as
+    // its own generic test, independent of keycloak_style_create_body(), now that
+    // little-auth/keycloak-scim-client's real request shape never sends `id` at all.
+    let client_supplied_id = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+    let (status, body) = send(
+        app(),
+        authed("POST", "/Users")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&json!({
+                "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                "userName": "bjensen",
+                "id": client_supplied_id,
+                "active": true
+            })))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_ne!(body["id"], json!(client_supplied_id));
 }
 
 #[tokio::test]
