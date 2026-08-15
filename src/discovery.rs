@@ -113,9 +113,7 @@ impl Drop for SubAttributesDepthGuard {
     }
 }
 
-fn deserialize_sub_attributes<'de, D>(
-    deserializer: D,
-) -> Result<Vec<AttributeDefinition>, D::Error>
+fn deserialize_sub_attributes<'de, D>(deserializer: D) -> Result<Vec<AttributeDefinition>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -572,7 +570,12 @@ mod tests {
         };
         assert!(is_case_exact(Some(&schema), None, "externalId", None));
         assert!(is_case_exact(Some(&schema), None, "id", None));
-        assert!(is_case_exact(Some(&schema), None, "meta", Some("resourceType")));
+        assert!(is_case_exact(
+            Some(&schema),
+            None,
+            "meta",
+            Some("resourceType")
+        ));
         assert!(is_case_exact(Some(&schema), None, "meta", Some("version")));
     }
 
@@ -603,7 +606,8 @@ mod tests {
             "uniqueness": "none"
         });
         if depth > 0 {
-            attr["subAttributes"] = serde_json::Value::Array(vec![nested_attribute_json(depth - 1)]);
+            attr["subAttributes"] =
+                serde_json::Value::Array(vec![nested_attribute_json(depth - 1)]);
         }
         attr
     }
@@ -659,7 +663,10 @@ mod tests {
             ]
         });
         let result: Result<SchemaResource, _> = serde_json::from_value(json);
-        assert!(result.is_ok(), "sibling nesting wrongly accumulated: {result:?}");
+        assert!(
+            result.is_ok(),
+            "sibling nesting wrongly accumulated: {result:?}"
+        );
     }
 
     /// Proves the thread-local depth counter is fully restored after a rejected deep

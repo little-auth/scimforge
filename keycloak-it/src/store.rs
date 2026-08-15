@@ -91,12 +91,10 @@ fn redact_sensitive(value: &mut Value) {
             // `path` is even a string. Default to redacting rather than silently
             // trusting that an unexpected shape couldn't be targeting a sensitive
             // attribute. True if *any* candidate path key targets one.
-            let targets_sensitive_attribute = path_keys.iter().any(|k| {
-                match map.get(k) {
-                    Some(Value::String(s)) => path_targets_a_sensitive_attribute(s),
-                    Some(_) => true,
-                    None => false,
-                }
+            let targets_sensitive_attribute = path_keys.iter().any(|k| match map.get(k) {
+                Some(Value::String(s)) => path_targets_a_sensitive_attribute(s),
+                Some(_) => true,
+                None => false,
             });
             if targets_sensitive_attribute {
                 let value_keys: Vec<String> = candidate_keys(map, "value")
@@ -201,7 +199,11 @@ mod tests {
         let captured = &store.captured[0].body;
         assert_eq!(captured["password"], json!(REDACTED));
         assert_eq!(captured["userName"], json!("bjensen"));
-        assert!(!captured.to_string().contains("correct horse battery staple"));
+        assert!(
+            !captured
+                .to_string()
+                .contains("correct horse battery staple")
+        );
     }
 
     #[test]

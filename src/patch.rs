@@ -99,7 +99,10 @@ pub enum PatchError {
     /// hand-authored or hand-edited schema document. This is a malformed schema, not a
     /// malformed request, but it is surfaced as a hard error rather than silently
     /// treated as the most permissive `readWrite`.
-    InvalidSchemaMutability { attr_name: String, mutability: String },
+    InvalidSchemaMutability {
+        attr_name: String,
+        mutability: String,
+    },
 }
 
 impl From<FilterError> for PatchError {
@@ -725,8 +728,8 @@ fn apply_add_or_replace(
             Ok(())
         }
         (None, None) => {
-            let attr_def = schema
-                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None));
+            let attr_def =
+                schema.and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None));
             let value = match attr_def {
                 Some(attr_def) => coerce_to_attribute_type(value, attr_def),
                 None => value,
@@ -743,8 +746,8 @@ fn apply_add_or_replace(
                     &value,
                 )?;
             }
-            let appends_onto_existing_array = !is_replace
-                && matches!(root.get(&path.attr_path.attr_name), Some(Value::Array(_)));
+            let appends_onto_existing_array =
+                !is_replace && matches!(root.get(&path.attr_path.attr_name), Some(Value::Array(_)));
             if appends_onto_existing_array {
                 let arr = root
                     .get_mut(&path.attr_path.attr_name)
@@ -760,8 +763,8 @@ fn apply_add_or_replace(
             Ok(())
         }
         (_, Some(value_filter)) => {
-            let attr_def = schema
-                .and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None));
+            let attr_def =
+                schema.and_then(|s| discovery::find_attribute(s, &path.attr_path.attr_name, None));
             let array = root
                 .get_mut(&path.attr_path.attr_name)
                 .and_then(Value::as_array_mut)
@@ -2122,17 +2125,17 @@ mod tests {
             &resource,
             &[op(
                 PatchOp::Replace,
-                Some(
-                    "urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber",
-                ),
+                Some("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber"),
                 Some(json!("12345")),
             )],
         )
         .unwrap_err();
         assert!(matches!(err, PatchError::SchemaQualifiedPath(_)));
-        assert!(resource
-            .get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber")
-            .is_none());
+        assert!(
+            resource
+                .get("urn:ietf:params:scim:schemas:extension:enterprise:2.0:User:employeeNumber")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2210,10 +2213,7 @@ mod tests {
             &schema,
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            PatchError::InvalidSchemaMutability { .. }
-        ));
+        assert!(matches!(err, PatchError::InvalidSchemaMutability { .. }));
         if let PatchError::InvalidSchemaMutability {
             attr_name,
             mutability,
@@ -2322,7 +2322,8 @@ mod tests {
     }
 
     #[test]
-    fn no_path_replace_rejects_a_whole_members_array_that_silently_omits_an_immutable_sub_attribute() {
+    fn no_path_replace_rejects_a_whole_members_array_that_silently_omits_an_immutable_sub_attribute()
+     {
         // Regression: check_entry_immutable_sub_attrs used to only inspect sub-attribute
         // keys present in the *new* entry, never the schema's own list of
         // immutable/readOnly sub-attributes -- so a replacement entry that simply
@@ -2350,7 +2351,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_top_level_path_replace_rejects_a_members_array_that_silently_omits_an_immutable_sub_attribute() {
+    fn explicit_top_level_path_replace_rejects_a_members_array_that_silently_omits_an_immutable_sub_attribute()
+     {
         let resource = group_with_two_members();
         let err = apply_patch_with_schema(
             &resource,
@@ -2369,7 +2371,8 @@ mod tests {
     }
 
     #[test]
-    fn bracket_filter_replace_with_no_trailing_sub_attr_rejects_silently_omitting_an_immutable_sub_attribute() {
+    fn bracket_filter_replace_with_no_trailing_sub_attr_rejects_silently_omitting_an_immutable_sub_attribute()
+     {
         let resource = group_with_two_members();
         let err = apply_patch_with_schema(
             &resource,
@@ -2446,7 +2449,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_top_level_path_add_rejects_a_bare_object_duplicate_value_with_forged_immutable_fields() {
+    fn explicit_top_level_path_add_rejects_a_bare_object_duplicate_value_with_forged_immutable_fields()
+     {
         // Regression: check_multivalued_complex_replace_mutability bailed out silently
         // (`new_value.as_array()` returning None) for a bare (non-array) object value,
         // even though apply_add_or_replace's own append logic explicitly accepts a bare
@@ -2511,11 +2515,7 @@ mod tests {
         let err = apply_patch_with_schema(
             &resource,
             &[
-                op(
-                    PatchOp::Remove,
-                    Some(r#"members[value eq "u-1"]"#),
-                    None,
-                ),
+                op(PatchOp::Remove, Some(r#"members[value eq "u-1"]"#), None),
                 op(
                     PatchOp::Add,
                     Some("members"),
@@ -2542,7 +2542,11 @@ mod tests {
         let resource = group_with_two_members();
         let after_remove = apply_patch_with_schema(
             &resource,
-            &[op(PatchOp::Remove, Some(r#"members[value eq "u-1"]"#), None)],
+            &[op(
+                PatchOp::Remove,
+                Some(r#"members[value eq "u-1"]"#),
+                None,
+            )],
             &crate::group::group_schema(),
         )
         .unwrap();

@@ -1088,7 +1088,10 @@ mod tests {
         // A bounded call proves it now terminates: it parses as an (empty, unresolved)
         // attribute-name path rather than hanging the test suite.
         let result = parse_patch_path("$");
-        assert!(result.is_ok(), "a lone '$' tokenizes as a single ident: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a lone '$' tokenizes as a single ident: {result:?}"
+        );
     }
 
     #[test]

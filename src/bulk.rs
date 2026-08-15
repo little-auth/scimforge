@@ -239,7 +239,11 @@ fn check_depth(depth: usize) -> Result<(), BulkError> {
 ///
 /// `depth` is checked against [`MAX_DEPTH`] before recursing further, since `data` is
 /// attacker-controlled and RFC 7644 imposes no nesting bound.
-fn find_bulk_id_refs(data: &Value, out: &mut HashSet<String>, depth: usize) -> Result<(), BulkError> {
+fn find_bulk_id_refs(
+    data: &Value,
+    out: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), BulkError> {
     check_depth(depth)?;
     match data {
         Value::String(s) => {
@@ -314,10 +318,8 @@ pub fn order_operations(operations: &[BulkOperationRequest]) -> Result<Vec<usize
         }
     }
 
-    let mut ready: BinaryHeap<Reverse<usize>> = (0..n)
-        .filter(|&i| in_degree[i] == 0)
-        .map(Reverse)
-        .collect();
+    let mut ready: BinaryHeap<Reverse<usize>> =
+        (0..n).filter(|&i| in_degree[i] == 0).map(Reverse).collect();
     let mut order = Vec::with_capacity(n);
     while let Some(Reverse(i)) = ready.pop() {
         order.push(i);

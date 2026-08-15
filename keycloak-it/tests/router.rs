@@ -253,7 +253,9 @@ async fn patching_password_never_echoes_or_persists_the_plaintext_value() {
 
     let (_, get_response) = send(
         router,
-        authed("GET", &format!("/Users/{id}")).body(Body::empty()).unwrap(),
+        authed("GET", &format!("/Users/{id}"))
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert!(
@@ -307,7 +309,9 @@ async fn patching_a_group_with_an_unmodeled_attribute_does_not_persist_it() {
 
     let (_, get_response) = send(
         router,
-        authed("GET", &format!("/Groups/{id}")).body(Body::empty()).unwrap(),
+        authed("GET", &format!("/Groups/{id}"))
+            .body(Body::empty())
+            .unwrap(),
     )
     .await;
     assert!(
