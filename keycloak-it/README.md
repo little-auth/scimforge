@@ -1,10 +1,10 @@
 # keycloak-it
 
 A disposable example SCIM 2.0 consumer plus a real-Keycloak conformance test harness for
-`scimitar` (GitHub issue #1: "Real-IdP conformance testing"). **Not a reference
+`scimforge` (GitHub issue #1: "Real-IdP conformance testing"). **Not a reference
 implementation** -- no persistence, no concurrency control beyond a single mutex, a
 single shared bearer token for auth, minimal error handling. It exists to give real
-Keycloak provisioning traffic somewhere to land, in front of `scimitar`'s own parsing and
+Keycloak provisioning traffic somewhere to land, in front of `scimforge`'s own parsing and
 PATCH-application code, so this repo's RFC-literal conformance claims can be checked
 against what a real, currently-maintained SCIM client actually sends -- not just against
 the spec text.
@@ -56,7 +56,7 @@ untyped would silently store the *string* `"true"`, not the boolean `true`, corr
 the resource's type shape (a later `serde_json::from_value::<User>` on that resource
 would then fail, even though the SCIM server itself accepted the request).
 
-`scimitar::patch::apply_patch_with_schema` (src/patch.rs in the crate root, not this
+`scimforge::patch::apply_patch_with_schema` (src/patch.rs in the crate root, not this
 directory) now coerces a PATCH `value` that's a JSON string into the target attribute's
 declared `boolean`/`integer`/`decimal` type, but *only* for an exact canonical string
 form of that type -- `"true"`/`"false"` exactly (not `"True"`, not `"TRUE"`), a clean
@@ -96,7 +96,7 @@ The live CI run surfaced four things no amount of source-reading caught:
   (a JPA lookup against its local mapping table, catching `NoResultException`). The
   Admin-API `DELETE` branch just didn't apply that same pattern consistently.
 
-  Not a `scimitar` bug and not something to work around by loosening validation --
+  Not a `scimforge` bug and not something to work around by loosening validation --
   `docker/patches/0001-fix-delete-npe.patch` fixes it directly in a locally-built plugin
   image (applied via `git apply` in `Dockerfile.keycloak-scim`, see the patch file's own
   header for the full writeup), so this harness's live conformance test can actually
@@ -117,7 +117,7 @@ The live CI run surfaced four things no amount of source-reading caught:
   `"emailVerified": true` in the request body is silently never pushed to the SCIM
   service provider at all -- no error, no log visible outside Keycloak's own DEBUG
   logging, just nothing arriving. This is plugin-specific business logic with no basis in
-  RFC 7644 (nothing to accommodate in `scimitar`), but it's essential operational
+  RFC 7644 (nothing to accommodate in `scimforge`), but it's essential operational
   knowledge for exercising the plugin at all, and the kind of thing that's easy to
   mistake for a harness bug rather than the plugin's actual, deliberate behavior. Found
   by the harness's first live run timing out waiting for a POST that never arrived, not
@@ -127,7 +127,7 @@ The live CI run surfaced four things no amount of source-reading caught:
   first attempt at `Dockerfile.keycloak-scim` cloned into `WORKDIR /build`, silently
   producing `build-1.0-SNAPSHOT-all.jar` instead of the expected
   `keycloak-scim-1.0-SNAPSHOT-all.jar`. Fixed by naming the build directory
-  `/keycloak-scim` to match. Not a scimitar or protocol finding, but a genuine "only a
+  `/keycloak-scim` to match. Not a scimforge or protocol finding, but a genuine "only a
   real build run would catch this" result.
 - **The plugin sends a full PUT by default, not the PATCH this harness was built to
   exercise.** `ScimStorageProviderFactory`'s config metadata defaults `user-patchOp` to
@@ -144,14 +144,14 @@ The live CI run surfaced four things no amount of source-reading caught:
 
 **Important note discovered along the way, not itself an accommodation**: the plugin's
 `UserAdapter.toSCIM()` also sets a client-side `id` value on the outbound resource
-representation. `scimitar::common::ResourceId`'s only *public constructor* is `new()`
+representation. `scimforge::common::ResourceId`'s only *public constructor* is `new()`
 (documented as being for server-generated values only), but its derived
 `#[serde(transparent)]` `Deserialize` impl doesn't route through that constructor --
 deserializing a request body with a client-supplied `id` will populate `User.id` anyway.
 `keycloak-it/src/users.rs::create()` deliberately overwrites `user.id` with a
 server-generated UUID *after* deserializing, discarding whatever the client sent, exactly
 matching the CVE-2025-41115 lesson this crate's README already calls out. This is
-correct, deliberate caller-side handling, not a gap in `scimitar` -- the crate can't
+correct, deliberate caller-side handling, not a gap in `scimforge` -- the crate can't
 distinguish "deserializing an untrusted client request" from "deserializing your own
 already-validated stored resource" from inside a generic `Deserialize` impl; that context
 is inherently the caller's to supply.
@@ -179,7 +179,7 @@ workflow file's own comments for why the separation is deliberate.
 ## What this harness does *not* cover
 
 - Filter-query evaluation over a collection (`GET /Users?filter=...`): out of scope for
-  `scimitar` itself (see `src/filter.rs`'s module doc) and not exercised by the plugin's
+  `scimforge` itself (see `src/filter.rs`'s module doc) and not exercised by the plugin's
   event-driven push path, which is what this harness targets. The plugin's optional
   periodic full-import sync does use it, but that path isn't wired up here.
 - Group propagation (`propagation-group`): the routes exist (`/Groups`), but the live

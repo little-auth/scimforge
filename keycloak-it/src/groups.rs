@@ -10,9 +10,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use scimitar::common::{Meta, ResourceId};
-use scimitar::group::{GROUP_SCHEMA_URI, Group, group_schema};
-use scimitar::patch::apply_patch_with_schema;
+use scimforge::common::{Meta, ResourceId};
+use scimforge::group::{GROUP_SCHEMA_URI, Group, group_schema};
+use scimforge::patch::apply_patch_with_schema;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -91,7 +91,7 @@ pub async fn list(State(state): State<AppState>) -> Json<Value> {
     let resources: Vec<Value> = store.groups.values().cloned().collect();
     let total = resources.len();
     Json(serde_json::json!({
-        "schemas": [scimitar::list_response::LIST_RESPONSE_SCHEMA_URI],
+        "schemas": [scimforge::list_response::LIST_RESPONSE_SCHEMA_URI],
         "totalResults": total,
         "startIndex": 1,
         "itemsPerPage": total,

@@ -1,9 +1,9 @@
-//! A disposable, in-memory SCIM 2.0 HTTP server built on `scimitar` -- exists solely to
+//! A disposable, in-memory SCIM 2.0 HTTP server built on `scimforge` -- exists solely to
 //! give GitHub issue #1 (real-IdP conformance testing) a live consumer to point a real
 //! Keycloak instance at. **Not a reference implementation**: no persistence, no
 //! concurrency control beyond a single mutex, minimal error handling, a single shared
 //! bearer token for auth. Do not copy this as a starting point for a production SCIM
-//! server -- copy `scimitar`'s own module docs instead.
+//! server -- copy `scimforge`'s own module docs instead.
 
 pub mod discovery;
 pub mod error;
@@ -73,15 +73,15 @@ async fn require_bearer_token(
     }
 }
 
-async fn service_provider_config() -> Json<scimitar::discovery::ServiceProviderConfig> {
+async fn service_provider_config() -> Json<scimforge::discovery::ServiceProviderConfig> {
     Json(discovery::service_provider_config())
 }
 
-async fn resource_types() -> Json<Vec<scimitar::discovery::ResourceType>> {
+async fn resource_types() -> Json<Vec<scimforge::discovery::ResourceType>> {
     Json(discovery::resource_types())
 }
 
-async fn schemas() -> Json<Vec<scimitar::discovery::SchemaResource>> {
+async fn schemas() -> Json<Vec<scimforge::discovery::SchemaResource>> {
     Json(discovery::schemas())
 }
 

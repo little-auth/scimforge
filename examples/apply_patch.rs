@@ -4,9 +4,9 @@
 //!
 //! Run with `cargo run --example apply_patch`.
 
-use scimitar::error::ScimError;
-use scimitar::patch::{PatchOp, PatchOperation, apply_patch_with_schema};
-use scimitar::user::user_schema;
+use scimforge::error::ScimError;
+use scimforge::patch::{PatchOp, PatchOperation, apply_patch_with_schema};
+use scimforge::user::user_schema;
 use serde_json::json;
 
 fn main() {

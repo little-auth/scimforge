@@ -1,4 +1,4 @@
-# scimitar
+# scimforge
 
 A SCIM 2.0 server-side protocol implementation for Rust: RFC 7643 (schema) and RFC 7644
 (protocol), including the two pieces that are actually hard, the filter-expression
@@ -64,7 +64,7 @@ whether an account already exists before creating one) -- evaluating a filter ag
 whole collection is a storage-layer concern this crate deliberately doesn't implement
 (see the filter grammar module's own doc comment), so it can't run that query for you.
 What it can do is answer the RFC question underneath it:
-[`discovery::is_case_exact`](https://docs.rs/scimitar/latest/scimitar/discovery/fn.is_case_exact.html)
+[`discovery::is_case_exact`](https://docs.rs/scimforge/latest/scimforge/discovery/fn.is_case_exact.html)
 is `pub` for exactly this -- resolve `caseExact` for any attribute path, including the
 common ones no per-resource schema declares, so a caller writing their own filter
 evaluator doesn't have to re-derive RFC 7643's rules by hand. (The link above will 404
@@ -78,10 +78,10 @@ also the crate's rustdoc front page). It's not the whole API -- see the module d
 (`cargo doc --open`) for bulk operations, discovery resources, and the rest.
 
 ```rust
-use scimitar::discovery::is_case_exact;
-use scimitar::filter;
-use scimitar::patch::{apply_patch, PatchOp, PatchOperation};
-use scimitar::user::{User, USER_SCHEMA_URI};
+use scimforge::discovery::is_case_exact;
+use scimforge::filter;
+use scimforge::patch::{apply_patch, PatchOp, PatchOperation};
+use scimforge::user::{User, USER_SCHEMA_URI};
 use serde_json::json;
 
 // Parse an incoming SCIM User creation request the way a real IdP actually sends one --
@@ -127,8 +127,8 @@ attributes only addable when they have no existing value yet -- using the exact 
 other:
 
 ```rust
-use scimitar::patch::{apply_patch_with_schema, PatchError, PatchOp, PatchOperation};
-use scimitar::user::user_schema;
+use scimforge::patch::{apply_patch_with_schema, PatchError, PatchOp, PatchOperation};
+use scimforge::user::user_schema;
 use serde_json::json;
 
 let schema = user_schema();
@@ -194,8 +194,8 @@ silently mis-typing it.
 ## License
 
 Licensed under either of
-[Apache License, Version 2.0](https://github.com/mario/scimitar/blob/main/LICENSE-APACHE)
-or [MIT license](https://github.com/mario/scimitar/blob/main/LICENSE-MIT) at your option.
+[Apache License, Version 2.0](https://github.com/little-auth/scimforge/blob/main/LICENSE-APACHE)
+or [MIT license](https://github.com/little-auth/scimforge/blob/main/LICENSE-MIT) at your option.
 (Relative links here would break once this README doubles as the crate's rustdoc front
 page via `#![doc = include_str!(...)]` -- rustdoc doesn't check plain markdown hyperlinks
 to local files the way it checks intra-doc `[`Type`]` links, so a relative path here would

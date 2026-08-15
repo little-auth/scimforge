@@ -1,5 +1,5 @@
 //! GitHub issue #1: real Keycloak + mitodl/keycloak-scim provisioning traffic against a
-//! live scimitar-based consumer. `#[ignore]`d by default -- this needs a running Keycloak
+//! live scimforge-based consumer. `#[ignore]`d by default -- this needs a running Keycloak
 //! (brought up separately via `keycloak-it/docker/docker-compose.yml`, not by this test
 //! itself, so CI can isolate "bring up the stack" from "drive it and assert" as two
 //! reviewable steps) reachable at `KEYCLOAK_BASE_URL` (default `http://localhost:8090`).
@@ -169,7 +169,7 @@ impl KeycloakAdmin {
                 // eec8ecd14971886f0d00f3dc688b587c3002f252) -- a real, currently-shipping
                 // Keycloak SCIM plugin simply does not provision a user via SCIM at all
                 // unless this Keycloak-side flag is set, independent of anything in RFC
-                // 7644. Nothing to accommodate in scimitar (this is plugin business
+                // 7644. Nothing to accommodate in scimforge (this is plugin business
                 // logic, not a request shape), but the harness needs it to exercise the
                 // plugin at all.
                 "emailVerified": true
@@ -300,7 +300,7 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     // RFC 7643 4.1.1's `active` is boolean -- this is the coercion fix's live-traffic
     // proof: whatever string/bool shape the plugin actually sent, the server's stored
     // (and here, captured pre-parse) response must reflect a real create having
-    // succeeded through scimitar's User deserialization, not just this test's assumption
+    // succeeded through scimforge's User deserialization, not just this test's assumption
     // of what Keycloak sends.
     assert_eq!(create_entry["method"], "POST");
     println!(

@@ -5,10 +5,10 @@
 //!
 //! Run with `cargo run --example filter_and_mutability`.
 
-use scimitar::discovery::is_case_exact;
-use scimitar::filter::{self, Filter};
-use scimitar::group::group_schema;
-use scimitar::patch::{PatchOp, PatchOperation, apply_patch_with_schema};
+use scimforge::discovery::is_case_exact;
+use scimforge::filter::{self, Filter};
+use scimforge::group::group_schema;
+use scimforge::patch::{PatchOp, PatchOperation, apply_patch_with_schema};
 use serde_json::json;
 
 fn main() {

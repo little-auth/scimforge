@@ -1,7 +1,7 @@
 //! In-memory resource storage plus a raw-request capture log. The capture log exists
 //! for exactly one reason: the Keycloak conformance test (`tests/keycloak_conformance.rs`)
 //! needs to inspect the *literal* JSON body a real Keycloak SCIM-plugin instance sent,
-//! not just this server's response -- that's the only way to tell "scimitar parsed real
+//! not just this server's response -- that's the only way to tell "scimforge parsed real
 //! traffic correctly" apart from "this server's handler happened to produce the right
 //! response regardless."
 //!

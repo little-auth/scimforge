@@ -1,6 +1,6 @@
 //! Parses RFC 7644 §3.5.2's PATCH request envelope
-//! (`{"schemas": [...], "Operations": [...]}`) into [`scimitar::patch::PatchOperation`]s.
-//! scimitar itself deliberately doesn't own this: `PatchOperation` isn't `Deserialize`
+//! (`{"schemas": [...], "Operations": [...]}`) into [`scimforge::patch::PatchOperation`]s.
+//! scimforge itself deliberately doesn't own this: `PatchOperation` isn't `Deserialize`
 //! (see `src/patch.rs`'s module doc -- the crate does no I/O and expects a caller to
 //! parse its own request envelope), so any real SCIM server built on it needs exactly
 //! this. This is where a real IdP's exact `op` casing matters -- checked against
@@ -11,7 +11,7 @@
 //! same "produce strict, accept loose" asymmetry here rather than assuming every real
 //! sender's `op` casing matches the RFC's examples byte-for-byte.
 
-use scimitar::patch::{PatchOp, PatchOperation};
+use scimforge::patch::{PatchOp, PatchOperation};
 use serde_json::Value;
 
 #[derive(Debug, PartialEq)]

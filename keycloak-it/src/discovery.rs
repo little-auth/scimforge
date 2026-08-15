@@ -5,18 +5,18 @@
 //! that reason, not because a real deployment necessarily needs `/ResourceTypes` wired up
 //! for the plugin's actual event-driven push flow to work.
 
-use scimitar::discovery::{
+use scimforge::discovery::{
     AuthenticationScheme, BulkConfig, FilterConfig, RESOURCE_TYPE_SCHEMA_URI, ResourceType,
     SERVICE_PROVIDER_CONFIG_SCHEMA_URI, SchemaResource, ServiceProviderConfig, Supported,
 };
-use scimitar::group::{GROUP_SCHEMA_URI, group_schema};
-use scimitar::user::{USER_SCHEMA_URI, enterprise_user_schema, user_schema};
+use scimforge::group::{GROUP_SCHEMA_URI, group_schema};
+use scimforge::user::{USER_SCHEMA_URI, enterprise_user_schema, user_schema};
 
 pub fn service_provider_config() -> ServiceProviderConfig {
     ServiceProviderConfig {
         schemas: vec![SERVICE_PROVIDER_CONFIG_SCHEMA_URI.to_string()],
         documentation_uri: Some(
-            "https://github.com/mario/scimitar/tree/main/keycloak-it".to_string(),
+            "https://github.com/little-auth/scimforge/tree/main/keycloak-it".to_string(),
         ),
         patch: Supported { supported: true },
         bulk: BulkConfig {
