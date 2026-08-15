@@ -105,7 +105,7 @@ pub enum PatchError {
     },
     /// [`apply_patch_with_schema`] only: correlating an entry of a multi-valued complex
     /// attribute to its counterpart in another array snapshot (this file's one identity
-    /// convention -- see [`find_entry_by_value`]) found more than one existing entry
+    /// convention -- see `find_entry_by_value`) found more than one existing entry
     /// sharing the same `value`. This crate's own shipped schemas make this state
     /// unreachable (`value` is declared `immutable` for every multi-valued complex
     /// attribute in `user_schema()`/`group_schema()`, and the immutability check on
@@ -123,7 +123,7 @@ pub enum PatchError {
     /// immutable/readOnly sibling sub-attribute today, since that's exactly the
     /// invariant a later schema edit could silently invalidate; correlating by `value`
     /// at all already assumes it uniquely identifies an entry (see
-    /// [`find_entry_by_value`]'s doc comment).
+    /// `find_entry_by_value`'s doc comment).
     AmbiguousEntryIdentity {
         attr_name: String,
         value: Value,
