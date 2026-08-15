@@ -1,10 +1,8 @@
-# Brings up a real Keycloak instance with the mitodl/keycloak-scim plugin installed, for
-# tests/keycloak_conformance.rs (GitHub issue #1). Dev-mode, no Postgres: this instance is
-# thrown away at the end of every run (ephemeral CI job or a developer's local `docker
-# compose down`), so the embedded dev datastore is simpler and faster than wiring up a
-# second service for state nothing needs to survive -- unlike the plugin's own
-# docker-compose.yml example, which persists to Postgres because it's meant for someone
-# poking at the admin console by hand, not a disposable CI run.
+# Brings up a real Keycloak instance with the in-house little-auth/keycloak-scim-client
+# plugin installed, for tests/keycloak_conformance.rs (GitHub issue #1). Dev-mode, no
+# Postgres: this instance is thrown away at the end of every run (ephemeral CI job or a
+# developer's local `docker compose down`), so the embedded dev datastore is simpler and
+# faster than wiring up a second service for state nothing needs to survive.
 services:
   keycloak:
     build:
@@ -13,10 +11,27 @@ services:
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
+      # `--vault=file` at build time (Dockerfile) only makes the file-vault provider
+      # available -- it must ALSO be selected again at runtime via KC_VAULT, or
+      # session.vault() silently returns Keycloak's no-op provider and every
+      # credentialVaultRef "resolves" to nothing. KC_VAULT_DIR is the correct runtime
+      # directory property to pair with KC_VAULT=file (not the SPI-prefixed
+      # KC_SPI_VAULT_FILES_PLAINTEXT_DIR) -- this exact pairing is proven live in
+      # keycloak-scim-client's own conformance/README.md, reused here rather than
+      # re-deriving it. Secret filenames follow the default REALM_UNDERSCORE_KEY resolver
+      # convention: `<realmName>_<vaultKey>`, referenced in component config as
+      # `${vault.<vaultKey>}` -- see tests/keycloak_conformance.rs for the exact realm/key
+      # this harness uses and how the secret file gets created before `docker compose up`.
+      KC_VAULT: file
+      KC_VAULT_DIR: /opt/keycloak/data/vault
+    volumes:
+      # Populated by the test setup (see keycloak-it/README.md's "Running the live
+      # conformance test" section) before `docker compose up` -- not committed, gitignored.
+      - ./vault:/opt/keycloak/data/vault:ro
     ports:
       - "8090:8080"
     extra_hosts:
-      # Linux Docker has no automatic host.docker.internal -- the SCIM plugin's outbound
+      # Linux Docker has no automatic host.docker.internal -- the plugin's outbound
       # requests need to reach keycloak-it's example server, which runs as a plain
       # process on the CI runner's host (in-process with the test binary, not its own
       # container -- see tests/keycloak_conformance.rs's module doc for why), not another

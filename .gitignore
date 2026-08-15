@@ -2,3 +2,6 @@
 Cargo.lock
 .DS_Store
 .usefinal/
+# Generated at test-run time (see keycloak-it/README.md) -- holds a plaintext Vault-SPI
+# secret file for the disposable Keycloak conformance instance; never committed.
+/keycloak-it/docker/vault/
