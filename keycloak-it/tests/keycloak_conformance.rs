@@ -379,12 +379,11 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
 
     // Bridges a real gap this stateful plugin introduces: this server observing the POST
     // only proves Keycloak's HTTP call completed, not that the plugin's own
-    // SCIM_SYNC_MAPPING row (scimId) write -- which
-    // happens synchronously right after, in the same background job, with no further
-    // network round trip this server could wait on -- has landed yet. Without this, the
-    // very next admin action below could race ahead of handleUpdate's
-    // `mapping.getScimId() == null` self-heal check and trigger an unwanted second CREATE
-    // instead of the intended PUT-replace.
+    // SCIM_SYNC_MAPPING row (scimId) write -- which happens synchronously right after, in
+    // the same background job, with no further network round trip this server could wait
+    // on -- has landed yet. Without this, the very next admin action below could race
+    // ahead of handleUpdate's `mapping.getScimId() == null` self-heal check and trigger an
+    // unwanted second CREATE instead of the intended PUT-replace.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     admin

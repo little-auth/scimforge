@@ -52,8 +52,12 @@ target credential through Keycloak's Vault SPI, so a plaintext secret file has t
 before `docker compose up` (never committed -- see `.gitignore`):
 
 ```sh
-# 1. Build the plugin jar (JDK 17, matching keycloak-scim-client's own .tool-versions)
+# 1. Build the plugin jar (JDK 17, matching keycloak-scim-client's own .tool-versions).
+#    Checking out the same commit CI pins to (see .github/workflows/keycloak-conformance.yml)
+#    keeps a local run reproducible with CI rather than floating on whatever main has
+#    moved to since this harness was last verified against it.
 cd path/to/keycloak-scim-client
+git checkout 845386c
 ./mvnw clean package -DskipTests
 cp target/keycloak-scim-client-*.jar path/to/scimforge/keycloak-it/docker/keycloak-scim-client.jar
 
