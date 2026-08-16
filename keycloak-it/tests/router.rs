@@ -33,6 +33,15 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, body)
 }
 
+async fn response_content_type(app: axum::Router, req: Request<Body>) -> Option<String> {
+    let response = app.oneshot(req).await.unwrap();
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 fn authed(method: &str, uri: &str) -> axum::http::request::Builder {
     Request::builder()
         .method(method)
@@ -59,6 +68,39 @@ fn keycloak_style_create_body() -> Value {
         "emails": [{"value": "bjensen@example.com", "primary": true}],
         "active": true
     })
+}
+
+#[tokio::test]
+async fn responses_declare_the_rfc_7644_registered_scim_media_type() {
+    // RFC 7644 3.1: "SCIM resources MUST include a Content-Type header field with the
+    // value 'application/scim+json'." Confirmed live: little-auth/keycloak-scim-client's
+    // scim-sdk-client-based HTTP client validates this strictly -- axum's plain
+    // Json<T> extractor defaults to "application/json", which the SDK doesn't
+    // recognize as success at all (a real Keycloak run against an unpatched server
+    // showed a genuine 201 Created logged by the plugin as a failed create, purely
+    // because of this header, with mapping.getScimId() then never getting set and every
+    // later action silently self-healing into a second CREATE instead of a real update).
+    let content_type = response_content_type(
+        app(),
+        authed("POST", "/Users")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&keycloak_style_create_body()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(content_type.as_deref(), Some("application/scim+json"));
+}
+
+#[tokio::test]
+async fn error_responses_also_declare_the_rfc_7644_registered_scim_media_type() {
+    let content_type = response_content_type(
+        app(),
+        authed("GET", "/Users/does-not-exist")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(content_type.as_deref(), Some("application/scim+json"));
 }
 
 #[tokio::test]

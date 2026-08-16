@@ -55,6 +55,28 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// RFC 7644 §3.1: "SCIM resources MUST include a Content-Type header field with the
+/// value 'application/scim+json'." `axum::Json<T>` defaults to plain `application/json`,
+/// which the SCIM SDK `little-auth/keycloak-scim-client` is built on validates strictly --
+/// confirmed live: a genuine `201 Created` with a plain `application/json` Content-Type
+/// was logged by the plugin as a *failed* create, purely because of this header, which
+/// then cascaded into `mapping.getScimId()` never getting set and every later admin
+/// action silently self-healing into a repeated CREATE instead of a real update. Applied
+/// as the outermost layer in `build_router` so it covers error responses too, not just
+/// success ones -- RFC 7644 §3.12's error body is itself a SCIM resource. Skips `204 No
+/// Content` (DELETE): a Content-Type header on a response with no body is meaningless and
+/// some strict clients flag it.
+async fn set_scim_content_type(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if response.status() != StatusCode::NO_CONTENT {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/scim+json"),
+        );
+    }
+    response
+}
+
 async fn require_bearer_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -130,6 +152,7 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             require_bearer_token,
         ))
+        .layer(middleware::from_fn(set_scim_content_type))
         .with_state(state)
 }
 
