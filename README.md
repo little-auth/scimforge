@@ -196,6 +196,10 @@ SDK `little-auth/keycloak-scim-client` is built on wraps even a single-valued re
 value this way (see `keycloak-it/`'s README for the live-run details, and
 `src/patch.rs`'s `coerce_to_attribute_type` doc comment for the full detail).
 
+## Releasing
+
+See [RELEASING.md](RELEASING.md).
+
 ## License
 
 Copyright (c) 2026 Mario Đanić

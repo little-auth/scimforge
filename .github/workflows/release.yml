@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag push skips the pull-request run entirely, so redo it here. Never
+  # publish something that hasn't passed its own gate.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A tag can point at any commit, including one that never went through a
+      # pull request or main's branch protections. Without this check, tagging
+      # is a way around every check the repository has.
+      - name: tagged commit is on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --doc
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run -p little-auth-scim
+
+      # The tag and the version in Cargo.toml disagreeing is the classic way to
+      # publish 0.1.0 twice and burn a version number.
+      - name: tag matches Cargo.toml version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${TAG#v}"
+          manifest=$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"] == "little-auth-scim"))')
+          if [ "$tag" != "$manifest" ]; then
+            echo "tag $tag != Cargo.toml $manifest" >&2
+            exit 1
+          fi
+
+  # The releases page is where people land from a search result or a link, so
+  # it should exist as soon as the tag does, without waiting on the approval
+  # that gates publishing to crates.io.
+  github_release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "little-auth-scim ${TAG#v}"
+          else
+            gh release create "$TAG" \
+              --title "little-auth-scim ${TAG#v}" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Protected by a required reviewer (repo Settings -> Environments ->
+    # crates-io) so a stray tag push can never publish on its own -- see
+    # RELEASING.md for how to configure the reviewer.
+    environment: crates-io
+    permissions:
+      # Trusted publishing: GitHub mints an OIDC token, crates.io exchanges it
+      # for a short-lived one. No CARGO_REGISTRY_TOKEN secret to leak or rotate.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
+        id: auth
+      - run: cargo publish -p little-auth-scim
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
