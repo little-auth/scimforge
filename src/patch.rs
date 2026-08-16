@@ -401,20 +401,41 @@ fn apply_remove(
     }
 }
 
-/// Coerces `value` to the JSON-native form of `attr_def`'s declared scalar type when
-/// `value` is a JSON string that is an exact canonical textual representation of that
-/// type -- accommodating real SCIM clients that send PATCH `value`s for boolean/integer/
-/// decimal attributes as JSON strings rather than RFC 7643's native JSON types for them
-/// (e.g. a language-native boolean-to-string conversion such as Java's
-/// `Boolean#toString()` landing in the wire `value` field as `"true"`/`"false"` rather
-/// than a native boolean -- see the crate README's real-IdP-conformance section for a
-/// concrete client that does this). Anything that isn't an exact canonical form (wrong
-/// case, leading zeros, whitespace, non-finite) is left untouched rather than guessed at
-/// -- this accommodates evidenced real senders, it isn't a general lenient-type parser.
-/// Only reachable from `apply_patch_with_schema`: `apply_patch` has no schema, so it has
-/// no declared type to coerce to, and keeps storing whatever JSON type it's given,
-/// unchanged.
+/// Coerces `value` toward the JSON-native form `attr_def` declares, accommodating two
+/// evidenced real-world SCIM client shapes rather than trusting RFC 7643's native types
+/// blindly. Only reachable from `apply_patch_with_schema`: `apply_patch` has no schema,
+/// so it has no declared type (or multi-valuedness) to coerce toward, and keeps storing
+/// whatever JSON shape it's given, unchanged.
+///
+/// 1. **Array-wrapped single value.** Some real SCIM SDKs (`de.captaingoldfish:scim-sdk-client`,
+///    confirmed live via `little-auth/keycloak-scim-client`'s outbound PATCH traffic:
+///    `{"path":"active","value":[false]}`, never a bare `false`) wrap even a
+///    single-valued attribute's PATCH replace value in a one-element JSON array. RFC 7644
+///    3.5.2's `value` is only ever legitimately an array for a *multi-valued* attribute,
+///    so a one-element array against a declared non-multi-valued attribute has exactly
+///    one sane reading and is unwrapped before anything else below. Zero or more than one
+///    element is left alone -- either a malformed request or a multi-valued write that
+///    reached the wrong branch, neither of which this function should guess at.
+/// 2. **String-encoded scalar.** A JSON string that is an exact canonical textual
+///    representation of `attr_def`'s declared type -- accommodating a real-world pattern
+///    (a language-native boolean-to-string conversion such as Java's
+///    `Boolean#toString()` landing in the wire `value` field as `"true"`/`"false"`
+///    rather than a native boolean) generically, not tied to any one client's name.
+///    Anything that isn't an exact canonical form (wrong case, leading zeros, whitespace,
+///    non-finite) is left untouched rather than guessed at.
+///
+/// Both accommodate one evidenced real sender each; neither is a general lenient-type
+/// parser, and they compose (an array-wrapped *and* string-encoded value unwraps, then
+/// coerces).
 fn coerce_to_attribute_type(value: Value, attr_def: &discovery::AttributeDefinition) -> Value {
+    let value = if !attr_def.multi_valued
+        && let Value::Array(items) = &value
+        && items.len() == 1
+    {
+        items[0].clone()
+    } else {
+        value
+    };
     let Value::String(s) = &value else {
         return value;
     };
@@ -1940,6 +1961,112 @@ mod tests {
             "loginCount": 3,
             "score": 1.5
         })
+    }
+
+    #[test]
+    fn schema_unwraps_a_single_element_array_wrapped_boolean_for_a_non_multi_valued_attribute() {
+        // de.captaingoldfish:scim-sdk-client (the SCIM SDK little-auth/keycloak-scim-client
+        // is built on) wraps even a single-valued boolean PATCH replace value in a
+        // one-element JSON array -- confirmed live: a captured outbound PATCH carried
+        // `{"path":"active","value":[false]}`, never a bare `false`. Before this fix, that
+        // array passed `coerce_to_attribute_type` untouched (it only recognized
+        // `Value::String`), landed in the merged document as a literal one-element array,
+        // and broke the very next typed round-trip (`serde_json::from_value::<User>`)
+        // with "invalid type: sequence, expected a boolean" -- an RFC-literal SCIM server
+        // built on this crate would reject a real, currently-shipping SCIM client's PATCH
+        // outright.
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!([false])))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!(false));
+        // The whole point: this must still deserialize as a typed User afterward, not
+        // just look right as a raw serde_json::Value.
+        let typed: crate::user::User = serde_json::from_value(result).unwrap();
+        assert_eq!(typed.active, Some(false));
+    }
+
+    #[test]
+    fn schema_does_not_unwrap_a_multi_element_array_for_a_non_multi_valued_attribute() {
+        // More than one element has no single sane reading for a non-multi-valued
+        // attribute -- left alone rather than guessed at, matching this function's
+        // existing "evidenced real sender, not a lenient parser" discipline.
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("active"),
+                Some(json!([false, true])),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!([false, true]));
+    }
+
+    #[test]
+    fn schema_does_not_unwrap_an_empty_array_for_a_non_multi_valued_attribute() {
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!([])))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!([]));
+    }
+
+    #[test]
+    fn schema_still_coerces_a_string_inside_a_single_element_array_wrapped_value() {
+        // The array-unwrap and the string-coercion compose: an SDK could plausibly wrap
+        // *and* string-encode in the same request.
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!(["false"])))],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!(false));
+    }
+
+    #[test]
+    fn unscoped_apply_patch_never_unwraps_an_array_wrapped_value_either() {
+        // Same "no schema, no coercion of any kind" rule this module already applies to
+        // the string-coercion case -- apply_patch has no attr_def.multi_valued to consult.
+        let resource = user_with_emails();
+        let result = apply_patch(
+            &resource,
+            &[op(PatchOp::Replace, Some("active"), Some(json!([false])))],
+        )
+        .unwrap();
+        assert_eq!(result["active"], json!([false]));
+    }
+
+    #[test]
+    fn schema_does_not_unwrap_a_single_element_array_for_a_genuinely_multi_valued_attribute() {
+        // A one-element array is exactly the normal, correct shape for replacing a
+        // multi-valued attribute with a single entry -- must NOT be unwrapped to a bare
+        // object, or the resource ends up with e.g. emails: {...} instead of emails: [{...}].
+        let resource = user_with_emails();
+        let result = apply_patch_with_schema(
+            &resource,
+            &[op(
+                PatchOp::Replace,
+                Some("emails"),
+                Some(json!([{"value": "new@example.com", "type": "work"}])),
+            )],
+            &crate::user::user_schema(),
+        )
+        .unwrap();
+        assert_eq!(
+            result["emails"],
+            json!([{"value": "new@example.com", "type": "work"}])
+        );
     }
 
     #[test]
