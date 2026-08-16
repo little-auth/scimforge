@@ -537,6 +537,24 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
              replace value in a JSON array: {}",
             active_op["value"]
         );
+
+        // Proves the PATCH succeeded outright, not that it was silently rejected and
+        // papered over by ScimTargetClient.setActive()'s own fetch-then-PUT fallback
+        // (which this server's earlier apply_patch_with_schema bug -- fixed in
+        // src/patch.rs -- would have silently triggered: this server's capture happens
+        // before its own deserialization/validation, so a rejected PATCH is captured
+        // exactly like an accepted one, and only a captured PUT that follows it reveals
+        // the fallback fired). A GET here isn't captured (users::get never calls
+        // store.capture), so a fallback would show up as a *second* new entry after this
+        // PATCH; a direct success leaves exactly one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let entries_after_delete = captured_users(&http).await.len() - captures_before_delete;
+        assert_eq!(
+            entries_after_delete, 1,
+            "expected exactly one new captured request (the successful PATCH) after \
+             delete -- a second one would mean the PATCH was rejected and \
+             ScimTargetClient silently fell back to fetch-then-PUT instead"
+        );
     } else {
         assert_eq!(deactivate_entry["body"]["active"], json!(false));
     }
