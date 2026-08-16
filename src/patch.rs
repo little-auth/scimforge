@@ -404,16 +404,16 @@ fn apply_remove(
 /// Coerces `value` to the JSON-native form of `attr_def`'s declared scalar type when
 /// `value` is a JSON string that is an exact canonical textual representation of that
 /// type -- accommodating real SCIM clients that send PATCH `value`s for boolean/integer/
-/// decimal attributes as JSON strings rather than RFC 7643's native JSON types for them.
-/// Concrete evidence, not a hypothetical: mitodl/keycloak-scim (an actively-maintained
-/// Keycloak SCIM client plugin, see the crate README's real-IdP-conformance section)
-/// builds `active`'s PATCH replace op as `.value(active.toString())` -- Java
-/// `Boolean#toString()` is the JSON string `"true"`/`"false"`, not a native boolean.
-/// Anything that isn't an exact canonical form (wrong case, leading zeros, whitespace,
-/// non-finite) is left untouched rather than guessed at -- this accommodates one
-/// evidenced real sender, it isn't a general lenient-type parser. Only reachable from
-/// `apply_patch_with_schema`: `apply_patch` has no schema, so it has no declared type to
-/// coerce to, and keeps storing whatever JSON type it's given, unchanged.
+/// decimal attributes as JSON strings rather than RFC 7643's native JSON types for them
+/// (e.g. a language-native boolean-to-string conversion such as Java's
+/// `Boolean#toString()` landing in the wire `value` field as `"true"`/`"false"` rather
+/// than a native boolean -- see the crate README's real-IdP-conformance section for a
+/// concrete client that does this). Anything that isn't an exact canonical form (wrong
+/// case, leading zeros, whitespace, non-finite) is left untouched rather than guessed at
+/// -- this accommodates evidenced real senders, it isn't a general lenient-type parser.
+/// Only reachable from `apply_patch_with_schema`: `apply_patch` has no schema, so it has
+/// no declared type to coerce to, and keeps storing whatever JSON type it's given,
+/// unchanged.
 fn coerce_to_attribute_type(value: Value, attr_def: &discovery::AttributeDefinition) -> Value {
     let Value::String(s) = &value else {
         return value;

@@ -1,44 +1,33 @@
-# Builds little-auth/keycloak-scim-client (an in-house Keycloak SCIM *client* plugin: it
-# turns Keycloak user Admin-API events into outbound SCIM calls to an external service
-# provider -- the direction GitHub issue #1 needs, matching how Okta/Azure AD operate, not
-# Keycloak's own newer native SCIM *server* support) from a pinned `main` commit, then
-# layers the resulting jar onto Keycloak. Mirrors the pattern keycloak-scim-client's own
-# `conformance/docker/Dockerfile.keycloak-scim-client` already uses for its own harness,
-# reused here rather than inventing an equivalent from scratch.
+# Builds a real Keycloak image with little-auth/keycloak-scim-client (an in-house Keycloak
+# SCIM *client* plugin: it turns Keycloak user Admin-API events into outbound SCIM calls
+# to an external service provider -- the direction GitHub issue #1 needs, matching how
+# Okta/Azure AD operate, not Keycloak's own newer native SCIM *server* support) installed.
+#
+# Mirrors keycloak-scim-client's own `conformance/docker/Dockerfile.keycloak-scim-client`
+# exactly: the jar is built host-side (see keycloak-it/README.md's "Running the live
+# conformance test") and COPYed in here, not cloned+built inside this Dockerfile.
+# `little-auth/keycloak-scim-client` is a private repository, so an in-container
+# `git clone` would need credentials baked into the image -- a real credential-leak risk
+# for a build artifact that ends up cached in Docker layers. Building host-side, where
+# whatever `gh`/git credentials the developer or CI runner already has apply, avoids that
+# entirely, and reuses the pattern the plugin's own conformance harness already proved
+# out rather than inventing a new one.
 #
 # Targets `main` only, Slice 1 functionality (provider id `keycloak-scim-target`; config
 # keys targetUrl/targetUrlAllowlistHosts/credentialVaultRef/deletePolicy/syncEnabled) -- the
 # three feature branches with Basic auth, reconciliation checkpointing, and hard-delete
-# confirmation UI are not merged into `main` as of this pin and are deliberately not built
-# against here.
-
-# eclipse-temurin:17 -- matches keycloak-scim-client's own `.tool-versions` pin (`java
-# temurin-17.0.20+8`) and its pom.xml's `maven.compiler.source`/`target` of 17. The base
-# image has no `git`, needed to clone the pinned commit below.
-FROM eclipse-temurin:17-jdk AS plugin-builder
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /keycloak-scim-client
-# Pinned to the tip of `main` at the time this harness was migrated to this plugin
-# (2026-08-16) -- verified to build with `./mvnw clean package`, the same wrapper the
-# project's own README documents.
-ARG KEYCLOAK_SCIM_CLIENT_COMMIT=845386c
-RUN git clone --no-checkout https://github.com/little-auth/keycloak-scim-client.git . \
-    && git checkout "${KEYCLOAK_SCIM_CLIENT_COMMIT}"
-RUN ./mvnw --batch-mode clean package -DskipTests
+# confirmation UI are not merged into `main` and are deliberately not built against here.
 
 # quay.io/keycloak/keycloak:25.0.6 -- pinned to match keycloak-scim-client's pom.xml
 # `<keycloak.version>25.0.6</keycloak.version>` (checked directly, not assumed); a newer
 # Keycloak risks Provider SPI drift the plugin's own build hasn't caught up to.
 FROM quay.io/keycloak/keycloak:25.0.6 AS keycloak-builder
-COPY --from=plugin-builder \
-    /keycloak-scim-client/target/keycloak-scim-client-0.1.0-SNAPSHOT.jar \
-    /opt/keycloak/providers/keycloak-scim-client.jar
-# `--vault=file` makes Keycloak's file-vault provider available at build time -- it must
-# ALSO be selected again at runtime via KC_VAULT (see docker-compose.yml), or it's never
-# actually used. Needed here because the harness resolves the SCIM target's bearer token
-# through `credentialVaultRef` (a Vault SPI reference), never a raw config value -- see
-# keycloak-scim-client's own conformance/README.md for the full incantation this mirrors.
+COPY keycloak-scim-client.jar /opt/keycloak/providers/keycloak-scim-client.jar
+# `--vault=file` (per `kc.sh build --help`'s "Vault:" section) makes the file-vault
+# provider available at build time -- it must be passed AGAIN at runtime (see
+# docker-compose.yml's KC_VAULT/KC_VAULT_DIR) or it's never actually selected. Needed
+# because the harness resolves the SCIM target's bearer token through `credentialVaultRef`
+# (a Vault SPI reference), never a raw config value.
 RUN /opt/keycloak/bin/kc.sh build --health-enabled=true --vault=file
 
 FROM quay.io/keycloak/keycloak:25.0.6

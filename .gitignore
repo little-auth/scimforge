@@ -5,3 +5,6 @@ Cargo.lock
 # Generated at test-run time (see keycloak-it/README.md) -- holds a plaintext Vault-SPI
 # secret file for the disposable Keycloak conformance instance; never committed.
 /keycloak-it/docker/vault/
+# Built host-side from little-auth/keycloak-scim-client before `docker compose up` (see
+# keycloak-it/README.md) -- a build artifact, not source.
+/keycloak-it/docker/keycloak-scim-client.jar

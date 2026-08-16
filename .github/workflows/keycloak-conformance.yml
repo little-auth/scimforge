@@ -1,17 +1,26 @@
 name: Keycloak Conformance (issue #1)
 
 # Deliberately a separate workflow from ci.yml's fast `test` job, not an extra step
-# folded into it: this exercises a real Keycloak instance plus a real third-party plugin
-# built from source via Gradle -- Docker startup time, a JVM build, and real network
-# timing between two live services, none of which belong in the fast/deterministic gate
-# every commit waits on. A slow or occasionally-flaky run here should never train anyone
-# to start ignoring red CI on the fast job. See the PR description's pre-mortem for the
-# full reasoning.
+# folded into it: this exercises a real Keycloak instance plus the in-house
+# little-auth/keycloak-scim-client plugin built from source via Maven -- Docker startup
+# time, a JVM build, and real network timing between two live services, none of which
+# belong in the fast/deterministic gate every commit waits on. A slow or occasionally-flaky
+# run here should never train anyone to start ignoring red CI on the fast job. See the PR
+# description's pre-mortem for the full reasoning.
 #
 # Path-filtered rather than running on every push: this job is materially slower (a cold
-# Gradle build of the plugin plus Keycloak's own startup) and only meaningfully exercises
+# Maven build of the plugin plus Keycloak's own startup) and only meaningfully exercises
 # keycloak-it and scimforge's PATCH engine, so unrelated changes (docs, other modules)
 # don't pay for it. `workflow_dispatch` is included so it can still be run on demand.
+#
+# PREREQUISITE, currently unmet as of this workflow revision: `little-auth/keycloak-scim-client`
+# is a PRIVATE repository, so checking it out below needs a token with read access to it --
+# a repo secret named KEYCLOAK_SCIM_CLIENT_PAT (a fine-grained PAT or deploy-key-backed
+# token scoped to that repo), which does not yet exist on this repo (`gh secret list`
+# returns empty as of this writing). Until that secret is added by someone with admin
+# access to little-auth/scimforge's repo settings, the checkout step below will fail with
+# a permissions/not-found error. This is a known, tracked gap, not a silent break --
+# see .usefinal/plans/migrate-keycloak-it-to-keycloak-scim-client-implementation.md.
 on:
   push:
     branches: [main]
@@ -36,7 +45,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: bring up Keycloak + mitodl/keycloak-scim
+      - name: check out little-auth/keycloak-scim-client (private repo -- see prerequisite note above)
+        uses: actions/checkout@v4
+        with:
+          repository: little-auth/keycloak-scim-client
+          ref: main
+          token: ${{ secrets.KEYCLOAK_SCIM_CLIENT_PAT }}
+          path: keycloak-scim-client-src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # Matches keycloak-scim-client's own .tool-versions pin (temurin-17.0.20+8) and
+          # its pom.xml maven.compiler.source/target of 17.
+          java-version: "17"
+      - name: build keycloak-scim-client.jar
+        working-directory: keycloak-scim-client-src
+        run: |
+          ./mvnw --batch-mode clean package -DskipTests
+          cp target/keycloak-scim-client-*.jar ../keycloak-it/docker/keycloak-scim-client.jar
+      - name: create the Vault-SPI secret file keycloak-scim-target's credentialVaultRef resolves
+        working-directory: keycloak-it/docker
+        run: |
+          mkdir -p vault
+          printf '%s' "scim-it-conformance-test-token" > vault/scim-it_scim-target-token
+      - name: bring up Keycloak + little-auth/keycloak-scim-client
         working-directory: keycloak-it/docker
         run: docker compose up --build -d
       - name: run the live conformance test against it

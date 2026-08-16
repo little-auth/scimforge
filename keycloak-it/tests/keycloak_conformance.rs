@@ -33,14 +33,12 @@
 //! Deprovisioning below deliberately leaves `deletePolicy` unset, exercising the plugin's
 //! default (`SOFT_DELETE`): a Keycloak user delete maps to a PATCH-with-PUT-fallback
 //! deactivation (`active: false`) on the SCIM target, never a literal HTTP DELETE verb --
-//! see `ScimTargetClient.deprovision`/`setActive`. This is also what proves the
-//! `mitodl/keycloak-scim` NullPointerException class this harness used to work around
-//! (via a now-deleted local patch) doesn't exist here: `AdminUserEventInterpreter.interpret`
-//! derives the deleted user's id from `AdminEvent#getResourcePath()` alone, never by
-//! re-fetching the (already-gone) user, so dispatch happens cleanly regardless of delete
-//! policy. `HARD_DELETE` (a genuine DELETE verb) is a real, separate configuration this
-//! harness doesn't exercise live -- filed as a follow-up rather than silently assumed
-//! equivalent to what's tested here.
+//! see `ScimTargetClient.deprovision`/`setActive`. This also proves a delete-after-row-gone
+//! dispatch never throws: `AdminUserEventInterpreter.interpret` derives the deleted user's
+//! id from `AdminEvent#getResourcePath()` alone, never by re-fetching the (already-gone)
+//! user, so dispatch happens cleanly regardless of delete policy. `HARD_DELETE` (a genuine
+//! DELETE verb) is a real, separate configuration this harness doesn't exercise live --
+//! filed as a follow-up rather than silently assumed equivalent to what's tested here.
 
 use std::time::Duration;
 
@@ -117,11 +115,11 @@ impl KeycloakAdmin {
             .json(&json!({
                 "realm": realm,
                 "enabled": true,
-                // "keycloak-scim-client" (ScimEventListenerProviderFactory.ID), not
-                // mitodl's "scim" -- confirmed live: an unfixed "scim" here produces
-                // "KC-SERVICES0083: Event listener 'scim' registered, but provider not
-                // found" and no SCIM traffic ever leaves Keycloak, no matter how correct
-                // the rest of the component config is.
+                // Must be "keycloak-scim-client" (ScimEventListenerProviderFactory.ID) --
+                // confirmed live: a wrong id here produces "KC-SERVICES0083: Event
+                // listener '<id>' registered, but provider not found" and no SCIM
+                // traffic ever leaves Keycloak, no matter how correct the rest of the
+                // component config is.
                 "eventsListeners": ["jboss-logging", "keycloak-scim-client"]
             }))
             .send()
@@ -367,7 +365,7 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     assert_eq!(create_entry["method"], "POST");
     // little-auth/keycloak-scim-client's KeycloakUserMapper.toScimUser() never sets `id`
     // (only externalId, the Keycloak user id) -- proving this server never received a
-    // client-supplied id to (incorrectly) trust in the first place, unlike mitodl's shape.
+    // client-supplied id to (incorrectly) trust in the first place.
     assert!(create_entry["body"].get("id").is_none());
     assert_eq!(create_entry["body"]["externalId"], json!(keycloak_user_id));
     println!(
@@ -379,9 +377,9 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
         create_entry["body"]
     );
 
-    // Bridges a real gap this stateful plugin introduces that the old stateless mitodl
-    // target didn't have: this server observing the POST only proves Keycloak's HTTP call
-    // completed, not that the plugin's own SCIM_SYNC_MAPPING row (scimId) write -- which
+    // Bridges a real gap this stateful plugin introduces: this server observing the POST
+    // only proves Keycloak's HTTP call completed, not that the plugin's own
+    // SCIM_SYNC_MAPPING row (scimId) write -- which
     // happens synchronously right after, in the same background job, with no further
     // network round trip this server could wait on -- has landed yet. Without this, the
     // very next admin action below could race ahead of handleUpdate's
@@ -395,10 +393,9 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
 
     // General Keycloak UPDATE admin events always dispatch a full PUT
     // (ScimEventListenerProvider.handleUpdate -> ScimTargetClient.replaceUser) -- there is
-    // no PATCH-on-plain-update path in keycloak-scim-client, unlike mitodl's
-    // user-patchOp-gated behavior this harness used to exercise. Asserting PUT
-    // specifically, not "PATCH or PUT", is itself a real conformance claim about this
-    // plugin's actual behavior, not a loosened check.
+    // no PATCH-on-plain-update path in keycloak-scim-client. Asserting PUT specifically,
+    // not "PATCH or PUT", is itself a real conformance claim about this plugin's actual
+    // behavior, not a loosened check.
     let update_entry = wait_for(
         "the example server to receive a PUT reflecting the disabled user",
         Duration::from_secs(30),
@@ -439,13 +436,10 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
 
     // Only reachable at all because keycloak-scim-client's AdminUserEventInterpreter
     // derives the deleted user's id purely from AdminEvent#getResourcePath(), never by
-    // re-fetching the (already-gone) user -- the exact bug class mitodl/keycloak-scim hit
-    // (NullPointerException, every single Admin-API user DELETE, because its handler
-    // called getUser(userId) and unconditionally dereferenced the null result) that this
-    // harness used to work around with a now-deleted local source patch. With the
-    // plugin's default SOFT_DELETE policy, a successful delete here dispatches a
-    // PATCH-with-PUT-fallback deactivation, not a literal DELETE verb -- see this file's
-    // module doc.
+    // re-fetching the (already-gone) user -- a delete-after-row-gone dispatch never
+    // throws here, by construction. With the plugin's default SOFT_DELETE policy, a
+    // successful delete here dispatches a PATCH-with-PUT-fallback deactivation, not a
+    // literal DELETE verb -- see this file's module doc.
     admin.delete_user(realm, &keycloak_user_id).await;
     let deactivate_entry = wait_for(
         "the example server to receive a new PATCH or PUT deactivating the deleted user",
@@ -481,9 +475,7 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
         // Confirmed live, and genuinely surprising: de.captaingoldfish:scim-sdk-client
         // (the SDK keycloak-scim-client is built on) wraps even a single-valued boolean
         // PATCH replace value in a JSON *array* -- `[false]`, not a bare `false` -- when
-        // built via `.valueNode(BooleanNode.valueOf(active))`. Not mitodl's
-        // string-coercion quirk (`"false"`); a different, SDK-specific wire shape this
-        // harness had never seen before this migration.
+        // built via `.valueNode(BooleanNode.valueOf(active))`.
         assert_eq!(active_op["value"], json!([false]));
         println!(
             "issue #1 finding -- scim-sdk-client wraps a single-valued boolean PATCH \
