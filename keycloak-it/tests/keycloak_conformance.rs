@@ -217,9 +217,9 @@ impl KeycloakAdmin {
     /// produces an admin event representation with no `userName`, and this server
     /// (correctly, per RFC 7643 4.1's REQUIRED `userName`) rejects the resulting outbound
     /// PUT with `400 missing field \`userName\``. `ScimEventListenerProvider`'s own
-    /// module doc states its UPDATE handling "always carries a complete representation" --
-    /// true for the common Admin-Console-driven case this method now matches, but not
-    /// guaranteed for every possible Admin-REST-API caller. Filed as a follow-up against
+    /// module doc states "every update carries a complete representation" -- true for the
+    /// common Admin-Console-driven case this method now matches, but not guaranteed for
+    /// every possible Admin-REST-API caller. Filed as a follow-up against
     /// keycloak-scim-client rather than fixed here (out of this harness's scope).
     async fn set_user_enabled_via_full_representation(
         &self,

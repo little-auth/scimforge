@@ -45,11 +45,13 @@ today, not those branches; nothing here should be read as covering them.
 ## Running the live conformance test
 
 Requires Docker, and a local checkout of `little-auth/keycloak-scim-client` (a private
-repo) to build the plugin jar host-side -- `Dockerfile.keycloak-scim` `COPY`s a
-pre-built jar rather than cloning inside the image, since baking clone credentials into a
-Dockerfile risks leaking them into cached image layers. The plugin also resolves its
-target credential through Keycloak's Vault SPI, so a plaintext secret file has to exist
-before `docker compose up` (never committed -- see `.gitignore`):
+repo -- if `git clone`/`gh repo clone` fails with a permissions error, you need read
+access added to that repo before any of this works) to build the plugin jar host-side --
+`Dockerfile.keycloak-scim` `COPY`s a pre-built jar rather than cloning inside the image,
+since baking clone credentials into a Dockerfile risks leaking them into cached image
+layers. The plugin also resolves its target credential through Keycloak's Vault SPI, so a
+plaintext secret file has to exist before `docker compose up` (never committed -- see
+`.gitignore`):
 
 ```sh
 # 1. Build the plugin jar (JDK 17, matching keycloak-scim-client's own .tool-versions).
@@ -120,10 +122,9 @@ exists to surface:
   minimal Admin-API usage pattern -- produces an outbound SCIM request missing the
   RFC-7643-REQUIRED `userName`, which this (and any RFC-literal) SCIM server correctly
   rejects with `400 missing field userName`. `ScimEventListenerProvider`'s own module doc
-  states general UPDATE events "always carry a complete representation" -- true for
-  Keycloak's own Admin Console (which GETs, mutates, and PUTs back the full
-  representation, the pattern this harness's live test now uses), but not guaranteed for
-  every Admin-REST-API caller.
+  states "every update carries a complete representation" -- true for Keycloak's own
+  Admin Console (which GETs, mutates, and PUTs back the full representation, the pattern
+  this harness's live test now uses), but not guaranteed for every Admin-REST-API caller.
 - **A genuinely surprising, but already-handled-correctly, SCIM SDK wire shape.**
   `scim-sdk-client`'s PATCH builder (`.valueNode(BooleanNode.valueOf(active))`) wraps even
   a single-valued boolean replace value in a JSON *array*:
