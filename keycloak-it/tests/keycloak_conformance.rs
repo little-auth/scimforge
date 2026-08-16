@@ -317,11 +317,13 @@ fn is_deactivation(entry: &Value) -> bool {
     }
 }
 
-// `is_deactivation` gates a load-bearing correctness property (see the module doc's note
-// on the race this fixed) but only ever runs inside the #[ignore]d live test above, which
-// needs Docker + a real Keycloak -- meaning `cargo test` alone, as CI's fast gate runs it,
-// exercises this function zero times. These unit tests close that gap without needing
-// Docker at all: pure function, synthetic `Value`s in, `bool` out.
+// `is_deactivation`'s own PATCH-vs-PUT shape matching is what the live test above relies
+// on to tell a genuine deprovision request apart from an unrelated one (see the module
+// doc's note on the capture-count race a *caller-side* fix addresses separately) -- but
+// this function only ever runs inside that #[ignore]d test, which needs Docker + a real
+// Keycloak. `cargo test` alone, as CI's fast gate runs it, exercises this function zero
+// times. These unit tests cover the predicate itself directly, no Docker needed: pure
+// function, synthetic `Value`s in, `bool` out.
 #[cfg(test)]
 mod is_deactivation_tests {
     use super::*;
