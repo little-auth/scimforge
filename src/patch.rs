@@ -34,13 +34,18 @@
 //! (no schema) still enforces the universal common-attribute protections unconditionally
 //! -- schema-driven checking is additive, not a replacement for that backstop.
 //!
-//! [`apply_patch_with_schema`] also coerces a PATCH `value` that's a JSON string into the
-//! attribute's declared scalar type (`boolean`/`integer`/`decimal`), but only for exact
-//! canonical string forms of that type (e.g. `"true"`, not `"True"`) -- real IdP traffic
-//! (GitHub issue #1: a real, actively-maintained Keycloak SCIM client plugin sends
-//! `boolean`-typed PATCH values as JSON strings via Java's `Boolean#toString()`), not a
-//! general lenient-type parser. [`apply_patch`] has no declared type to coerce to and
-//! never does this.
+//! [`apply_patch_with_schema`] also accommodates two real-world PATCH `value` shapes for
+//! `boolean`/`integer`/`decimal` attributes rather than trusting RFC 7643's native types
+//! blindly, neither guessing beyond an exact, evidenced shape: a JSON string that's an
+//! exact canonical textual form of the declared type (e.g. `"true"`, not `"True"`) coerces
+//! to that native type -- a generic defensive accommodation, not evidenced by any specific
+//! sender in this crate's own real-IdP conformance traffic (GitHub issue #1). A `value`
+//! arriving as a one-element JSON array against a declared non-multi-valued attribute
+//! unwraps before that same coercion runs -- this one *is* live-evidenced: real-IdP
+//! conformance traffic against `little-auth/keycloak-scim-client` showed
+//! `de.captaingoldfish:scim-sdk-client` (the SCIM SDK that plugin is built on) wrapping
+//! even a single-valued boolean PATCH replace value this way. [`apply_patch`] has no
+//! declared type or multi-valuedness to coerce toward and never does either of this.
 
 use serde_json::{Map, Value};
 
