@@ -117,7 +117,12 @@ impl KeycloakAdmin {
             .json(&json!({
                 "realm": realm,
                 "enabled": true,
-                "eventsListeners": ["jboss-logging", "scim"]
+                // "keycloak-scim-client" (ScimEventListenerProviderFactory.ID), not
+                // mitodl's "scim" -- confirmed live: an unfixed "scim" here produces
+                // "KC-SERVICES0083: Event listener 'scim' registered, but provider not
+                // found" and no SCIM traffic ever leaves Keycloak, no matter how correct
+                // the rest of the component config is.
+                "eventsListeners": ["jboss-logging", "keycloak-scim-client"]
             }))
             .send()
             .await
@@ -202,7 +207,46 @@ impl KeycloakAdmin {
         location.rsplit('/').next().unwrap().to_string()
     }
 
-    async fn set_user_enabled(&self, realm: &str, user_id: &str, enabled: bool) {
+    /// Fetches the user's current full representation and PUTs it back with `enabled`
+    /// toggled -- matching how Keycloak's own Admin Console actually updates a user
+    /// (GET, mutate locally, PUT the complete representation back), not a minimal
+    /// `{"enabled": ...}` body.
+    ///
+    /// Confirmed live this distinction is load-bearing, not cosmetic:
+    /// `KeycloakUserMapper.toScimUser` maps whatever `AdminEvent#getRepresentation()`
+    /// carries, which is the raw admin-request body Keycloak logged for that event, not a
+    /// server-side merge with the persisted user -- a minimal `{"enabled": false}` body
+    /// produces an admin event representation with no `userName`, and this server
+    /// (correctly, per RFC 7643 4.1's REQUIRED `userName`) rejects the resulting outbound
+    /// PUT with `400 missing field \`userName\``. `ScimEventListenerProvider`'s own
+    /// module doc states its UPDATE handling "always carries a complete representation" --
+    /// true for the common Admin-Console-driven case this method now matches, but not
+    /// guaranteed for every possible Admin-REST-API caller. Filed as a follow-up against
+    /// keycloak-scim-client rather than fixed here (out of this harness's scope).
+    async fn set_user_enabled_via_full_representation(
+        &self,
+        realm: &str,
+        user_id: &str,
+        enabled: bool,
+    ) {
+        let current = self
+            .client
+            .get(format!(
+                "{}/admin/realms/{realm}/users/{user_id}",
+                self.base_url
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("get user request");
+        assert!(
+            current.status().is_success(),
+            "get user failed: {}",
+            current.status()
+        );
+        let mut representation: Value = current.json().await.expect("user representation body");
+        representation["enabled"] = json!(enabled);
+
         let resp = self
             .client
             .put(format!(
@@ -210,7 +254,7 @@ impl KeycloakAdmin {
                 self.base_url
             ))
             .bearer_auth(&self.token)
-            .json(&json!({"enabled": enabled}))
+            .json(&representation)
             .send()
             .await
             .expect("update user request");
@@ -346,7 +390,7 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     admin
-        .set_user_enabled(realm, &keycloak_user_id, false)
+        .set_user_enabled_via_full_representation(realm, &keycloak_user_id, false)
         .await;
 
     // General Keycloak UPDATE admin events always dispatch a full PUT
@@ -371,6 +415,12 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     .await;
     assert_eq!(update_entry["method"], "PUT");
     assert_eq!(update_entry["body"]["active"], json!(false));
+    // Proves this PUT actually deserializes as a complete, acceptable SCIM User (RFC 7643
+    // 4.1's REQUIRED userName present) -- the thing set_user_enabled_via_full_representation
+    // exists to guarantee. A PUT missing userName would still get captured here (capture
+    // happens before this server's own deserialization/validation), so this assertion is
+    // what actually distinguishes "arrived" from "arrived and was acceptable."
+    assert_eq!(update_entry["body"]["userName"], json!(username));
     println!(
         "issue #1 finding -- PUT /Users/{{id}} Content-Type: {:?}",
         update_entry["contentType"]
@@ -379,6 +429,13 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
         "issue #1 finding -- PUT /Users/{{id}} body: {}",
         update_entry["body"]
     );
+
+    // Snapshot how many captures exist before triggering delete: the deactivation search
+    // below must find a *new* entry, not spuriously re-match update_entry above (both can
+    // legitimately be a PUT carrying active:false, so a shape-only predicate isn't enough
+    // on its own -- confirmed live this matters: without this guard, an actual delete-time
+    // dispatch failure was masked by silently re-matching the update step's own capture).
+    let captures_before_delete = captured_users(&http).await.len();
 
     // Only reachable at all because keycloak-scim-client's AdminUserEventInterpreter
     // derives the deleted user's id purely from AdminEvent#getResourcePath(), never by
@@ -391,7 +448,7 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     // module doc.
     admin.delete_user(realm, &keycloak_user_id).await;
     let deactivate_entry = wait_for(
-        "the example server to receive a PATCH or PUT deactivating the deleted user",
+        "the example server to receive a new PATCH or PUT deactivating the deleted user",
         Duration::from_secs(30),
         || {
             let http = http.clone();
@@ -399,6 +456,7 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
                 captured_users(&http)
                     .await
                     .into_iter()
+                    .skip(captures_before_delete)
                     .find(|e| e["id"].is_string() && is_deactivation(e))
             }
         },
@@ -420,13 +478,43 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
             .iter()
             .find(|op| op["path"] == "active")
             .expect("PATCH deprovision must target the active attribute");
-        // keycloak-scim-client's setActive() sends a native JSON boolean
-        // (BooleanNode.valueOf), never mitodl's string-coerced "false" -- the coercion
-        // this harness's core library implements for a *string*-valued boolean PATCH
-        // simply isn't exercised by this plugin's real traffic, and this assertion says
-        // so plainly rather than silently expecting the old shape.
-        assert_eq!(active_op["value"], json!(false));
+        // Confirmed live, and genuinely surprising: de.captaingoldfish:scim-sdk-client
+        // (the SDK keycloak-scim-client is built on) wraps even a single-valued boolean
+        // PATCH replace value in a JSON *array* -- `[false]`, not a bare `false` -- when
+        // built via `.valueNode(BooleanNode.valueOf(active))`. Not mitodl's
+        // string-coercion quirk (`"false"`); a different, SDK-specific wire shape this
+        // harness had never seen before this migration.
+        assert_eq!(active_op["value"], json!([false]));
+        println!(
+            "issue #1 finding -- scim-sdk-client wraps a single-valued boolean PATCH \
+             replace value in a JSON array: {}",
+            active_op["value"]
+        );
     } else {
         assert_eq!(deactivate_entry["body"]["active"], json!(false));
     }
+
+    // The strongest available proof this whole request actually applied correctly, not
+    // just that this server's capture log recorded *something*: fetch the resource back
+    // from this server's own store (still there under SOFT_DELETE -- deprovisioning
+    // deactivates, it doesn't remove the resource) and check `active` landed as a real
+    // JSON boolean. This is scimforge's own apply_patch_with_schema unwrapping the
+    // array-wrapped value above, proven against real SDK traffic, not just the synthetic
+    // shapes in tests/router.rs.
+    let scim_id = deactivate_entry["id"]
+        .as_str()
+        .expect("deactivate_entry must carry the SCIM resource id");
+    let get_resp = http
+        .get(format!("http://localhost:{SERVER_PORT}/Users/{scim_id}"))
+        .bearer_auth(BEARER_TOKEN)
+        .send()
+        .await
+        .expect("get deactivated user request");
+    assert!(
+        get_resp.status().is_success(),
+        "get user failed: {}",
+        get_resp.status()
+    );
+    let persisted: Value = get_resp.json().await.expect("persisted user body");
+    assert_eq!(persisted["active"], json!(false));
 }
