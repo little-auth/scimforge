@@ -1,9 +1,11 @@
 //! Hand-authored discovery documents describing exactly what this disposable server
-//! actually implements -- not a maximal/aspirational capability list. mitodl/keycloak-scim
-//! documents needing `/ServiceProviderConfig`, `/Schemas`, and `/ResourceTypes` reachable
-//! (`ScimStorageProviderFactory`'s "endpoint" config help text), so these three exist for
-//! that reason, not because a real deployment necessarily needs `/ResourceTypes` wired up
-//! for the plugin's actual event-driven push flow to work.
+//! actually implements -- not a maximal/aspirational capability list. The Keycloak plugin
+//! under test (`little-auth/keycloak-scim-client`) fetches `/ServiceProviderConfig` on
+//! every `ScimTargetClient` construction to seed its PATCH-capability detection
+//! (`ScimTargetClient::fetchPatchSupport`), so that endpoint in particular has to be
+//! reachable and accurate for the plugin's PATCH-vs-PUT fallback logic to behave
+//! correctly; `/Schemas` and `/ResourceTypes` exist for completeness rather than because
+//! the plugin's own event-driven push flow calls them today.
 
 use scimforge::discovery::{
     AuthenticationScheme, BulkConfig, FilterConfig, RESOURCE_TYPE_SCHEMA_URI, ResourceType,

@@ -74,10 +74,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_exact_keycloak_plugin_shaped_active_replace_op() {
-        // mitodl/keycloak-scim's UserAdapter.toPatchBuilder() shape -- value is the JSON
-        // *string* "true", not a native boolean (see src/patch.rs's coercion doc comment
-        // for the core-library side of this).
+    fn parses_a_string_valued_boolean_replace_op() {
+        // Some SCIM clients send a JSON *string* "true" rather than a native boolean for
+        // a boolean-typed attribute (see src/patch.rs's coercion doc comment for the
+        // core-library side of this) -- this parser stays agnostic about the value's JSON
+        // type either way; coercion, if any, happens downstream.
         let body = json!({
             "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
             "Operations": [

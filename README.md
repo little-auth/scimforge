@@ -180,16 +180,21 @@ production directory sync.
 
 Real-IdP conformance testing (issue #1) now has a live consumer: `keycloak-it/` is a
 disposable example SCIM server built on this crate's own types, exercised in CI against a
-real Keycloak instance running [mitodl/keycloak-scim](https://github.com/mitodl/keycloak-scim)
-(an actively-maintained Keycloak SCIM client plugin -- Keycloak pushing provisioning
-events out, the same direction Okta/Azure AD operate in). One accommodation came out of
-that research directly, not from a live traffic capture (see `keycloak-it/`'s README for
-the full account, including why): `apply_patch_with_schema` now coerces a PATCH `value`
-that's an exact canonical string form of a `boolean`/`integer`/`decimal` attribute's
-declared type (e.g. `"true"`, not `"True"`) into that native JSON type, matching a
-real, currently-maintained Keycloak plugin's PATCH request shape
-(`.value(active.toString())` for a boolean attribute) instead of rejecting or
-silently mis-typing it.
+real Keycloak instance running [little-auth/keycloak-scim-client](https://github.com/little-auth/keycloak-scim-client)
+(the in-house Keycloak SCIM client plugin -- Keycloak pushing provisioning events out, the
+same direction Okta/Azure AD operate in; targets that plugin's `main` branch only, Slice 1
+functionality). `apply_patch_with_schema` accommodates two real-world PATCH `value`
+shapes (the schema is what supplies a declared type/cardinality to coerce toward --
+`apply_patch` has none of this and stores whatever JSON shape it's given), neither
+guessing beyond an exact, evidenced shape: a `value` that's an exact canonical string
+form of a `boolean`/`integer`/`decimal` attribute's declared type (e.g. `"true"`, not
+`"True"`) coerces to that native JSON type -- a defensive, generically-motivated
+accommodation, not one this specific live traffic evidenced. A `value` arriving as a
+one-element JSON array against a declared non-multi-valued attribute unwraps before that
+same coercion runs -- this one *is* exactly what the live traffic proved: the real SCIM
+SDK `little-auth/keycloak-scim-client` is built on wraps even a single-valued replace
+value this way (see `keycloak-it/`'s README for the live-run details, and
+`src/patch.rs`'s `coerce_to_attribute_type` doc comment for the full detail).
 
 ## License
 

@@ -6,155 +6,41 @@ implementation** -- no persistence, no concurrency control beyond a single mutex
 single shared bearer token for auth, minimal error handling. It exists to give real
 Keycloak provisioning traffic somewhere to land, in front of `scimforge`'s own parsing and
 PATCH-application code, so this repo's RFC-literal conformance claims can be checked
-against what a real, currently-maintained SCIM client actually sends -- not just against
-the spec text.
+against what a real SCIM client actually sends -- not just against the spec text.
 
-## Why this plugin, and not another one
+## What this targets
 
-The direction needed is Keycloak acting as a SCIM *client*, pushing provisioning events
-to an external service provider -- the same role Okta and Azure AD play against a real
-SCIM SP. That's the opposite direction from Keycloak's own newer native "SCIM Realm API"
-(experimental as of Keycloak 26.6, per the Keycloak project's own blog), which makes
-Keycloak itself a SCIM *server*.
+Keycloak acting as a SCIM *client*, pushing provisioning events to an external service
+provider -- the same role Okta and Azure AD play against a real SCIM SP. That's the
+opposite direction from Keycloak's own newer native "SCIM Realm API" (experimental as of
+Keycloak 26.6), which makes Keycloak itself a SCIM *server*.
 
-Chosen: [**mitodl/keycloak-scim**](https://github.com/mitodl/keycloak-scim) (Apache-2.0).
-Checked directly against its source rather than assumed:
+The plugin under test is [**little-auth/keycloak-scim-client**](https://github.com/little-auth/keycloak-scim-client)
+-- an in-house Keycloak SCIM client plugin, replacing a prior third-party dependency this
+harness used to build from source. Built on the same `de.captaingoldfish:scim-sdk-client`
+SCIM SDK family, so requests are RFC-shaped by construction rather than hand-rolled per
+call site.
 
-- Architecture: an Event Listener (provider id `scim`) turns Keycloak user/group changes
-  into outbound SCIM calls; a User Storage Provider component (also id `scim`) holds the
-  per-realm config (`endpoint`, `content-type`, `auth-mode`, `auth-pass`,
-  `propagation-user`/`propagation-group`) -- see
-  `src/main/java/sh/libre/scim/storage/ScimStorageProviderFactory.java`.
-- Built on `de.captaingoldfish:scim-sdk-common`/`scim-sdk-client` 1.25.1, a spec-driven
-  SCIM SDK -- requests are RFC-shaped by construction, not hand-rolled per call site.
-- `build.gradle` on `main` compiles against `org.keycloak:keycloak-*:25.0.6`
-  (`compileOnly`), which is why this harness's Dockerfile pins
-  `quay.io/keycloak/keycloak:25.0.6` rather than a newer release -- a newer Keycloak risks
-  Provider SPI drift the plugin's own build hasn't caught up to yet.
-- Maintenance: commits (Renovate dependency bumps, verified) through 2026-04-01, i.e.
-  actively maintained within the last several months of this harness being built
-  (2026-08-13).
+**Targets `main` only, Slice 1 functionality.** As of this writing, `main` has:
 
-## The one accommodation this research produced
+- Provider id `keycloak-scim-target` (a User Storage Provider SPI component), config keys
+  `targetUrl`, `targetUrlAllowlistHosts`, `credentialVaultRef` (a Keycloak Vault SPI
+  reference, resolved to a Bearer token -- never a raw secret in config), `deletePolicy`
+  (`SOFT_DELETE`/`HARD_DELETE`), `syncEnabled` (a live kill switch, default off).
+- General Keycloak Admin-API `UPDATE` events always dispatch a full PUT
+  (`ScimEventListenerProvider.handleUpdate` -> `ScimTargetClient.replaceUser`); there is no
+  PATCH-on-plain-update path.
+- Deprovisioning honors the realm's `deletePolicy`: `SOFT_DELETE` (the default) PATCHes
+  `active` to `false` (falling back to a fetch-then-PUT if PATCH isn't supported or
+  errors), `HARD_DELETE` issues a real `DELETE`.
+- No group sync at all -- `AdminUserEventInterpreter` only interprets `ResourceType.USER`
+  admin events.
 
-`UserAdapter.toPatchBuilder()` (pinned commit
-[`eec8ecd14971886f0d00f3dc688b587c3002f252`](https://github.com/mitodl/keycloak-scim/blob/eec8ecd14971886f0d00f3dc688b587c3002f252/src/main/java/sh/libre/scim/core/UserAdapter.java))
-builds the PATCH op for `active` as:
-
-```java
-patchBuilder.addOperation()
-    .path("active")
-    .op(PatchOp.REPLACE)
-    .value(active.toString())
-```
-
-Java's `Boolean#toString()` is the string `"true"`/`"false"`, and the SDK's
-`.value(String)` overload puts that literally into the wire `value` field --
-`{"op":"replace","path":"active","value":"true"}`. RFC 7643 §2.3 declares `active` as
-`type: boolean`; a strict RFC-literal PATCH engine that just merges JSON values in
-untyped would silently store the *string* `"true"`, not the boolean `true`, corrupting
-the resource's type shape (a later `serde_json::from_value::<User>` on that resource
-would then fail, even though the SCIM server itself accepted the request).
-
-`scimforge::patch::apply_patch_with_schema` (src/patch.rs in the crate root, not this
-directory) now coerces a PATCH `value` that's a JSON string into the target attribute's
-declared `boolean`/`integer`/`decimal` type, but *only* for an exact canonical string
-form of that type -- `"true"`/`"false"` exactly (not `"True"`, not `"TRUE"`), a clean
-integer parse that round-trips (not `"007"`, not `" 42"`), a clean finite decimal parse
-(not `"Infinity"`/`"NaN"`). Anything else passes through unchanged. This only applies to
-`apply_patch_with_schema` (the schema is what supplies the declared type to coerce
-toward); `apply_patch` has no schema and keeps storing whatever JSON type it's given.
-
-This was found by reading the plugin's source, not by capturing live traffic -- there was
-no Docker daemon available in the sandbox this harness was originally built in. The live
-Keycloak run (below) is what actually confirms it, or would surface anything this
-source-reading approach missed.
-
-## Findings from actually running it (not derivable from reading source alone)
-
-The live CI run surfaced four things no amount of source-reading caught:
-
-- **The plugin NullPointerExceptions on every single Admin-API user DELETE.**
-  `ScimEventListenerProvider.onEvent(AdminEvent, boolean)`'s `DELETE` branch calls
-  `getUser(userId)` to check `user.isEmailVerified()` before dispatching -- the same
-  pattern the `CREATE`/`UPDATE` branches use. But by the time the `DELETE` admin event
-  fires, Keycloak has already removed that user's row: `getUser` always returns `null`,
-  and the unchecked `user.isEmailVerified()` call throws
-  `NullPointerException: Cannot invoke "org.keycloak.models.UserModel.isEmailVerified()"
-  because "user" is null` at `ScimEventListenerProvider.java:87`, every time, for every
-  delete. Confirmed both in CI (`KC-SERVICES0085: Failed to send type to
-  ScimEventListenerProvider`) and reproduced locally against a live Keycloak +
-  freshly-built plugin image, not inferred from the CI log alone. The plugin's own event
-  listener crashes before it ever builds the outbound SCIM request -- no DELETE reaches
-  a configured service provider under this plugin version, full stop, no matter how a
-  caller is configured or how long it waits.
-
-  The plugin's own code already has the right pattern for this exact situation: the
-  self-service `EventType.DELETE_ACCOUNT` branch a few lines above in the same file
-  dispatches unconditionally, no `isEmailVerified()` check at all, since
-  `ScimClient.delete()` already has its own safe no-op for a user that was never synced
-  (a JPA lookup against its local mapping table, catching `NoResultException`). The
-  Admin-API `DELETE` branch just didn't apply that same pattern consistently.
-
-  Not a `scimforge` bug and not something to work around by loosening validation --
-  `docker/patches/0001-fix-delete-npe.patch` fixes it directly in a locally-built plugin
-  image (applied via `git apply` in `Dockerfile.keycloak-scim`, see the patch file's own
-  header for the full writeup), so this harness's live conformance test can actually
-  prove the full create/update/delete lifecycle instead of giving up on a third of it.
-  Filed upstream at
-  [mitodl/keycloak-scim#181](https://github.com/mitodl/keycloak-scim/issues/181), fix
-  proposed at
-  [mitodl/keycloak-scim#182](https://github.com/mitodl/keycloak-scim/pull/182) -- remove
-  the patch and the `git apply` step once an equivalent fix lands there and this
-  harness's pinned `KEYCLOAK_SCIM_COMMIT` moves past it.
-
-- **The plugin gates every SCIM push on the Keycloak user's `emailVerified` flag.**
-  `ScimEventListenerProvider.onEvent(AdminEvent, boolean)` -- the handler for
-  Admin-REST-API-triggered changes, which is how this harness (and any real provisioning
-  workflow driven by an admin console or API, not user self-service) creates/updates
-  users -- wraps every one of its `CREATE`/`UPDATE`/`DELETE` branches in
-  `if (user.isEmailVerified()) { ... }`. A Keycloak user created without
-  `"emailVerified": true` in the request body is silently never pushed to the SCIM
-  service provider at all -- no error, no log visible outside Keycloak's own DEBUG
-  logging, just nothing arriving. This is plugin-specific business logic with no basis in
-  RFC 7644 (nothing to accommodate in `scimforge`), but it's essential operational
-  knowledge for exercising the plugin at all, and the kind of thing that's easy to
-  mistake for a harness bug rather than the plugin's actual, deliberate behavior. Found
-  by the harness's first live run timing out waiting for a POST that never arrived, not
-  by anything checkable from source alone.
-- **Gradle project naming is directory-sensitive.** `mitodl/keycloak-scim` has no
-  `settings.gradle`, so Gradle names the root project after the containing directory; a
-  first attempt at `Dockerfile.keycloak-scim` cloned into `WORKDIR /build`, silently
-  producing `build-1.0-SNAPSHOT-all.jar` instead of the expected
-  `keycloak-scim-1.0-SNAPSHOT-all.jar`. Fixed by naming the build directory
-  `/keycloak-scim` to match. Not a scimforge or protocol finding, but a genuine "only a
-  real build run would catch this" result.
-- **The plugin sends a full PUT by default, not the PATCH this harness was built to
-  exercise.** `ScimStorageProviderFactory`'s config metadata defaults `user-patchOp` to
-  `false`; without explicitly setting it `true` in the SCIM federation provider's config,
-  `ScimClient.replace()` always takes the `scimRequestBuilder.update(...)` (full-replace)
-  branch, never `adapter.toPatchBuilder(...)` -- confirmed by a live run whose captured
-  update was a `PUT` with natively-typed JSON (`"active":false`, a real boolean, no
-  coercion needed). The `active.toString()` string-coercion scenario `src/patch.rs`'s
-  coercion fix exists for only happens through the PATCH path, which needs
-  `"user-patchOp": ["true"]` in the provider config to ever fire at all. With it set, a
-  live run's captured PATCH body shows `{"path":"active","value":"false"}` verbatim --
-  the JSON string, not the boolean -- which is the actual, real-traffic proof the
-  coercion fix's own doc comment predicted from reading the plugin's source alone.
-
-**Important note discovered along the way, not itself an accommodation**: the plugin's
-`UserAdapter.toSCIM()` also sets a client-side `id` value on the outbound resource
-representation. `scimforge::common::ResourceId`'s only *public constructor* is `new()`
-(documented as being for server-generated values only), but its derived
-`#[serde(transparent)]` `Deserialize` impl doesn't route through that constructor --
-deserializing a request body with a client-supplied `id` will populate `User.id` anyway.
-`keycloak-it/src/users.rs::create()` deliberately overwrites `user.id` with a
-server-generated UUID *after* deserializing, discarding whatever the client sent, exactly
-matching the CVE-2025-41115 lesson this crate's README already calls out. This is
-correct, deliberate caller-side handling, not a gap in `scimforge` -- the crate can't
-distinguish "deserializing an untrusted client request" from "deserializing your own
-already-validated stored resource" from inside a generic `Deserialize` impl; that context
-is inherently the caller's to supply.
+Three other features -- Basic auth, reconciliation checkpointing, and a hard-delete
+confirmation UI -- exist on separate branches (`feat/basic-auth-support`,
+`feat/reconciliation-checkpointing`, `feat/hard-delete-confirmation-ui`) that are **not
+merged into `main`** as of this writing. This harness targets what's actually on `main`
+today, not those branches; nothing here should be read as covering them.
 
 ## `de.captaingoldfish:scim-sdk-client` vs. `scimforge` -- interop findings (little-auth/keycloak-scim-client)
 
@@ -229,9 +115,33 @@ answers the narrower question it covers (a different overload, an older SDK vers
 
 ## Running the live conformance test
 
-Requires Docker.
+Requires Docker, and a local checkout of `little-auth/keycloak-scim-client` (a private
+repo -- if `git clone`/`gh repo clone` fails with a permissions error, you need read
+access added to that repo before any of this works) to build the plugin jar host-side --
+`Dockerfile.keycloak-scim` `COPY`s a pre-built jar rather than cloning inside the image,
+since baking clone credentials into a Dockerfile risks leaking them into cached image
+layers. The plugin also resolves its target credential through Keycloak's Vault SPI, so a
+plaintext secret file has to exist before `docker compose up` (never committed -- see
+`.gitignore`):
 
 ```sh
+# 1. Build the plugin jar (JDK 17, matching keycloak-scim-client's own .tool-versions).
+#    Checking out the same commit CI pins to (see .github/workflows/keycloak-conformance.yml)
+#    keeps a local run reproducible with CI rather than floating on whatever main has
+#    moved to since this harness was last verified against it.
+cd path/to/keycloak-scim-client
+git checkout 845386c
+./mvnw clean package -DskipTests
+cp target/keycloak-scim-client-*.jar path/to/scimforge/keycloak-it/docker/keycloak-scim-client.jar
+
+# 2. Create the vault secret the credentialVaultRef in the test's component config
+#    resolves through (REALM_UNDERSCORE_KEY convention: realm "scim-it" + key
+#    "scim-target-token")
+cd path/to/scimforge
+mkdir -p keycloak-it/docker/vault
+printf '%s' "scim-it-conformance-test-token" > keycloak-it/docker/vault/scim-it_scim-target-token
+
+# 3. Bring up Keycloak with the plugin installed, then run the live test
 cd keycloak-it/docker
 docker compose up --build -d
 cd ..
@@ -247,12 +157,85 @@ In CI, this runs as its own workflow (`.github/workflows/keycloak-conformance.ym
 separate from the fast `cargo test` gate (`.github/workflows/ci.yml`) -- see that
 workflow file's own comments for why the separation is deliberate.
 
+## Findings from actually running it
+
+A real Docker daemon was available while this harness was built, so this section is a
+genuine live run -- `docker compose up --build -d` against a real Keycloak 25.0.6 image
+with a host-built `keycloak-scim-client` jar, then the `#[ignore]`d test against it -- not
+inferred from reading source. The full CREATE / UPDATE / deprovision (deactivate) lifecycle
+passes end to end, confirmed both by this harness's own assertions and by
+`ScimEventListenerProvider`'s own `SCIM sync: ... -> SUCCESS` log lines inside the
+Keycloak container.
+
+Getting to a clean pass took five real, live-only findings -- exactly what this harness
+exists to surface:
+
+- **Realm event listener id.** The realm's `eventsListeners` config needs
+  `keycloak-scim-client` (`ScimEventListenerProviderFactory.ID`). Get this wrong and
+  Keycloak logs `KC-SERVICES0083: Event listener '<id>' registered, but provider not
+  found`, and zero SCIM traffic ever leaves Keycloak -- easy to miss because Keycloak
+  accepts the realm-create call with the wrong id just fine, the failure only shows up
+  later, silently, as a timeout on the other end.
+- **This harness's own server was missing the SCIM media type.** `scim-it-server`'s
+  responses never set `Content-Type: application/scim+json` (axum's `Json<T>` defaults to
+  plain `application/json`). `scim-sdk-client` -- the SDK `keycloak-scim-client` is built
+  on -- validates the response `Content-Type` strictly: a genuine `201 Created` create was
+  logged by the plugin as a *failed* create purely because of this header, and the
+  resulting missing `SCIM_SYNC_MAPPING` row cascaded into every later admin action
+  silently self-healing into a repeated CREATE instead of a real update. Fixed here (a
+  `set_scim_content_type` response middleware, test-first) -- this was a bug in
+  `keycloak-it`, not in `keycloak-scim-client`.
+- **A real limitation in `keycloak-scim-client` itself** (not fixed here, per this
+  migration's scope -- filed upstream instead): `KeycloakUserMapper.toScimUser` maps
+  whatever `AdminEvent#getRepresentation()` carries verbatim. For Keycloak's Admin REST
+  API, that's the raw request body a caller sent for that specific call, not a
+  server-merged full representation. A minimal `{"enabled": false}` PUT -- a legitimate,
+  minimal Admin-API usage pattern -- produces an outbound SCIM request missing the
+  RFC-7643-REQUIRED `userName`, which this (and any RFC-literal) SCIM server correctly
+  rejects with `400 missing field userName`. `ScimEventListenerProvider`'s own module doc
+  states "every update carries a complete representation" -- true for Keycloak's own
+  Admin Console (which GETs, mutates, and PUTs back the full representation, the pattern
+  this harness's live test now uses), but not guaranteed for every Admin-REST-API caller.
+- **A real `scimforge` core-library bug, found live and fixed.** `scim-sdk-client`'s PATCH
+  builder (`.valueNode(BooleanNode.valueOf(active))`) wraps even a single-valued boolean
+  replace value in a JSON *array*: `{"path":"active","value":[false]}`, not a bare
+  `false`. `apply_patch_with_schema`'s `coerce_to_attribute_type` only recognized
+  `Value::String`, so that array passed through untouched, landed in the merged document
+  as a literal one-element array, and broke the very next typed round-trip
+  (`serde_json::from_value::<User>`) with `invalid type: sequence, expected a boolean` --
+  this server actually **rejected** the plugin's PATCH with a `400`. The first live run
+  that hit this looked like a pass: `ScimTargetClient.setActive()` treats a `4xx` PATCH
+  response as "PATCH not supported," records that, and silently falls back to a
+  fetch-then-PUT that *does* succeed (a native, fully-typed representation needs no
+  coercion) -- so the resource ended up correctly deactivated for the wrong reason, and
+  it took comparing this server's own capture log against `ScimEventListenerProvider`'s
+  Keycloak-side logs to catch that the "successful" run was actually PATCH-rejected,
+  PUT-recovered. Fixed in `src/patch.rs` (`coerce_to_attribute_type` now unwraps a
+  one-element array against a declared non-multi-valued attribute before coercing, RFC
+  7644 3.5.2's `value` only ever legitimately being an array for a multi-valued one) --
+  re-verified live afterward with a new assertion that counts captured requests, proving
+  the PATCH now succeeds on the first attempt with no fallback PUT following it.
+- **A race in this harness's own test, not in `keycloak-scim-client`.** An earlier version
+  of the deactivation-entry search matched by shape alone (any `PUT`/`PATCH` carrying
+  `active: false`), which the prior UPDATE step's own captured request can also satisfy --
+  a genuinely failed or missing delete-time dispatch was silently masked by re-matching
+  that stale entry, and the test still went green. Caught by cross-checking the Keycloak
+  container's own logs against the test's claims, not by the test failing on its own.
+  Fixed by snapshotting the capture count before triggering delete and requiring a
+  strictly later match.
+
 ## What this harness does *not* cover
 
 - Filter-query evaluation over a collection (`GET /Users?filter=...`): out of scope for
   `scimforge` itself (see `src/filter.rs`'s module doc) and not exercised by the plugin's
-  event-driven push path, which is what this harness targets. The plugin's optional
-  periodic full-import sync does use it, but that path isn't wired up here.
-- Group propagation (`propagation-group`): the routes exist (`/Groups`), but the live
-  conformance test only drives `propagation-user`.
+  event-driven push path, which is what this harness targets.
+- Group sync: `keycloak-scim-client`'s `main` branch has no group-sync feature at all
+  (Slice 1 only handles `ResourceType.USER` admin events) -- `/Groups` routes exist so
+  this server isn't a 404 against `scimforge`'s own group support, but nothing in the live
+  conformance test drives them, and there's no plugin-side config key to point at them yet.
+- `HARD_DELETE`: the live conformance test only exercises `keycloak-scim-target`'s default
+  `deletePolicy` (`SOFT_DELETE`), which deprovisions via PATCH/PUT deactivation, not a
+  literal `DELETE` verb. `HARD_DELETE` is a real, separate code path
+  (`ScimTargetClient.deleteUser`) not currently driven by live traffic here -- tracked as
+  a follow-up, not silently assumed equivalent.
 - Bulk operations (RFC 7644 §3.7): the plugin doesn't use them.

@@ -1,8 +1,16 @@
-//! GitHub issue #1: real Keycloak + mitodl/keycloak-scim provisioning traffic against a
-//! live scimforge-based consumer. `#[ignore]`d by default -- this needs a running Keycloak
-//! (brought up separately via `keycloak-it/docker/docker-compose.yml`, not by this test
-//! itself, so CI can isolate "bring up the stack" from "drive it and assert" as two
+//! GitHub issue #1: real Keycloak + little-auth/keycloak-scim-client provisioning traffic
+//! against a live scimforge-based consumer. `#[ignore]`d by default -- this needs a running
+//! Keycloak (brought up separately via `keycloak-it/docker/docker-compose.yml`, not by this
+//! test itself, so CI can isolate "bring up the stack" from "drive it and assert" as two
 //! reviewable steps) reachable at `KEYCLOAK_BASE_URL` (default `http://localhost:8090`).
+//!
+//! Targets `keycloak-scim-client`'s `main` branch only (Slice 1: provider id
+//! `keycloak-scim-target`, config keys `targetUrl`/`targetUrlAllowlistHosts`/
+//! `credentialVaultRef`/`deletePolicy`/`syncEnabled`). The plugin's Basic-auth,
+//! reconciliation-checkpointing, and hard-delete-confirmation-UI features live on separate
+//! unmerged feature branches (`feat/basic-auth-support`,
+//! `feat/reconciliation-checkpointing`, `feat/hard-delete-confirmation-ui`) and aren't
+//! built or exercised here.
 //!
 //! This test runs the example SCIM server (`keycloak_it::build_router`) in-process on a
 //! fixed port rather than as its own container, specifically so it can assert directly
@@ -10,23 +18,27 @@
 //! hop -- Keycloak (in Docker) reaches this process via `host.docker.internal`, wired up
 //! by the compose file's `extra_hosts`.
 //!
-//! Run locally (with Docker):
+//! Run locally (with Docker), after creating the Vault-SPI secret file the SCIM target
+//! component's `credentialVaultRef` resolves through (see `keycloak-it/README.md`'s
+//! "Running the live conformance test" for the full walkthrough):
 //! ```text
+//! mkdir -p keycloak-it/docker/vault
+//! printf '%s' "scim-it-conformance-test-token" > keycloak-it/docker/vault/scim-it_scim-target-token
 //! cd keycloak-it/docker && docker compose up --build -d
-//! cargo test -p keycloak-it --test keycloak_conformance -- --ignored --nocapture
+//! cd ..
+//! KEYCLOAK_BASE_URL=http://localhost:8090 \
+//!   cargo test -p keycloak-it --test keycloak_conformance -- --ignored --nocapture
 //! ```
 //!
-//! The DELETE assertion below only passes because of
-//! `docker/patches/0001-fix-delete-npe.patch`. A live run against the unpatched, pinned
-//! plugin commit found `ScimEventListenerProvider.onEvent(AdminEvent, ..)`'s DELETE branch
-//! NullPointerExceptions every time: it calls `getUser(userId)` to check
-//! `user.isEmailVerified()` before dispatching, but by the time the DELETE admin event
-//! fires, Keycloak has already removed the user row, so `getUser` returns `null` and the
-//! unchecked `.isEmailVerified()` call throws -- the plugin's own event listener crashes
-//! before it ever builds the outbound SCIM request, so no DELETE reaches this server at
-//! all without the patch, no matter how long this test waits. See
-//! `keycloak-it/README.md`'s findings section for the exact stack trace and the patch's
-//! own header for the upstream fix this mitigates.
+//! Deprovisioning below deliberately leaves `deletePolicy` unset, exercising the plugin's
+//! default (`SOFT_DELETE`): a Keycloak user delete maps to a PATCH-with-PUT-fallback
+//! deactivation (`active: false`) on the SCIM target, never a literal HTTP DELETE verb --
+//! see `ScimTargetClient.deprovision`/`setActive`. This also proves a delete-after-row-gone
+//! dispatch never throws: `AdminUserEventInterpreter.interpret` derives the deleted user's
+//! id from `AdminEvent#getResourcePath()` alone, never by re-fetching the (already-gone)
+//! user, so dispatch happens cleanly regardless of delete policy. `HARD_DELETE` (a genuine
+//! DELETE verb) is a real, separate configuration this harness doesn't exercise live --
+//! filed as a follow-up rather than silently assumed equivalent to what's tested here.
 
 use std::time::Duration;
 
@@ -75,7 +87,7 @@ impl KeycloakAdmin {
         let base_url = keycloak_base_url();
         let client = reqwest::Client::new();
         // Keycloak's dev-mode startup (plus, on a cold `docker compose up --build`, the
-        // plugin's own Gradle-built jar loading) can take well over a minute -- a bounded
+        // plugin's own Maven-built jar loading) can take well over a minute -- a bounded
         // retry loop here, not a fixed sleep, so this both fails fast on a truly broken
         // stack and doesn't flake on a slow-but-healthy one.
         let token = wait_for(
@@ -103,7 +115,12 @@ impl KeycloakAdmin {
             .json(&json!({
                 "realm": realm,
                 "enabled": true,
-                "eventsListeners": ["jboss-logging", "scim"]
+                // Must be "keycloak-scim-client" (ScimEventListenerProviderFactory.ID) --
+                // confirmed live: a wrong id here produces "KC-SERVICES0083: Event
+                // listener '<id>' registered, but provider not found" and no SCIM
+                // traffic ever leaves Keycloak, no matter how correct the rest of the
+                // component config is.
+                "eventsListeners": ["jboss-logging", "keycloak-scim-client"]
             }))
             .send()
             .await
@@ -122,29 +139,35 @@ impl KeycloakAdmin {
             .bearer_auth(&self.token)
             .json(&json!({
                 "name": "scim-it-server",
-                "providerId": "scim",
+                "providerId": "keycloak-scim-target",
                 "providerType": "org.keycloak.storage.UserStorageProvider",
                 "config": {
-                    "endpoint": [server_url_from_keycloaks_perspective()],
-                    "content-type": ["application/json"],
-                    "auth-mode": ["BEARER"],
-                    "auth-pass": [BEARER_TOKEN],
-                    "propagation-user": ["true"],
-                    "propagation-group": ["false"],
-                    // Without this, ScimClient.replace() sends a full PUT (confirmed by a
-                    // live run: UserAdapter.toSCIM() serializes typed JSON, no coercion
-                    // needed) -- the plugin only takes the toPatchBuilder() path this
-                    // harness exists to exercise (active.toString(), a JSON *string*
-                    // "false"/"true") when user-patchOp is explicitly enabled.
-                    "user-patchOp": ["true"]
+                    "targetUrl": [server_url_from_keycloaks_perspective()],
+                    // TargetUrlValidator (SSRF guard) rejects a non-HTTPS URL and any
+                    // address in a private/internal range unless the host is explicitly
+                    // allowlisted -- host.docker.internal is exactly the "local/CI
+                    // conformance target" case its own doc comment names.
+                    "targetUrlAllowlistHosts": ["host.docker.internal"],
+                    // Resolved through Keycloak's Vault SPI at dispatch time, never a raw
+                    // secret in this config -- see this file's module doc for the vault
+                    // secret file this reference resolves against (REALM_UNDERSCORE_KEY
+                    // convention: realm "scim-it" + key "scim-target-token").
+                    "credentialVaultRef": ["${vault.scim-target-token}"],
+                    // Live kill switch, default false -- omitting this would leave every
+                    // admin event resolving to "sync disabled for realm" and every
+                    // wait_for below timing out with a misleading panic instead of a
+                    // clear cause.
+                    "syncEnabled": ["true"]
+                    // deletePolicy deliberately omitted -- see module doc for why this
+                    // exercises the plugin's SOFT_DELETE default rather than HARD_DELETE.
                 }
             }))
             .send()
             .await
-            .expect("create SCIM federation provider component request");
+            .expect("create SCIM target component request");
         assert!(
             resp.status().is_success(),
-            "create SCIM federation provider failed: {} {}",
+            "create SCIM target component failed: {} {}",
             resp.status(),
             resp.text().await.unwrap_or_default()
         );
@@ -160,19 +183,7 @@ impl KeycloakAdmin {
                 "email": format!("{username}@example.com"),
                 "firstName": "Babs",
                 "lastName": "Jensen",
-                "enabled": true,
-                // Found only by running this live (first attempt timed out waiting for
-                // a POST that never came): ScimEventListenerProvider.onEvent(AdminEvent,
-                // ..) gates every one of CREATE/UPDATE/DELETE on
-                // `user.isEmailVerified()` (src/main/java/sh/libre/scim/event/
-                // ScimEventListenerProvider.java, pinned commit
-                // eec8ecd14971886f0d00f3dc688b587c3002f252) -- a real, currently-shipping
-                // Keycloak SCIM plugin simply does not provision a user via SCIM at all
-                // unless this Keycloak-side flag is set, independent of anything in RFC
-                // 7644. Nothing to accommodate in scimforge (this is plugin business
-                // logic, not a request shape), but the harness needs it to exercise the
-                // plugin at all.
-                "emailVerified": true
+                "enabled": true
             }))
             .send()
             .await
@@ -194,7 +205,46 @@ impl KeycloakAdmin {
         location.rsplit('/').next().unwrap().to_string()
     }
 
-    async fn set_user_enabled(&self, realm: &str, user_id: &str, enabled: bool) {
+    /// Fetches the user's current full representation and PUTs it back with `enabled`
+    /// toggled -- matching how Keycloak's own Admin Console actually updates a user
+    /// (GET, mutate locally, PUT the complete representation back), not a minimal
+    /// `{"enabled": ...}` body.
+    ///
+    /// Confirmed live this distinction is load-bearing, not cosmetic:
+    /// `KeycloakUserMapper.toScimUser` maps whatever `AdminEvent#getRepresentation()`
+    /// carries, which is the raw admin-request body Keycloak logged for that event, not a
+    /// server-side merge with the persisted user -- a minimal `{"enabled": false}` body
+    /// produces an admin event representation with no `userName`, and this server
+    /// (correctly, per RFC 7643 4.1's REQUIRED `userName`) rejects the resulting outbound
+    /// PUT with `400 missing field \`userName\``. `ScimEventListenerProvider`'s own
+    /// module doc states "every update carries a complete representation" -- true for the
+    /// common Admin-Console-driven case this method now matches, but not guaranteed for
+    /// every possible Admin-REST-API caller. Filed as a follow-up against
+    /// keycloak-scim-client rather than fixed here (out of this harness's scope).
+    async fn set_user_enabled_via_full_representation(
+        &self,
+        realm: &str,
+        user_id: &str,
+        enabled: bool,
+    ) {
+        let current = self
+            .client
+            .get(format!(
+                "{}/admin/realms/{realm}/users/{user_id}",
+                self.base_url
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .expect("get user request");
+        assert!(
+            current.status().is_success(),
+            "get user failed: {}",
+            current.status()
+        );
+        let mut representation: Value = current.json().await.expect("user representation body");
+        representation["enabled"] = json!(enabled);
+
         let resp = self
             .client
             .put(format!(
@@ -202,7 +252,7 @@ impl KeycloakAdmin {
                 self.base_url
             ))
             .bearer_auth(&self.token)
-            .json(&json!({"enabled": enabled}))
+            .json(&representation)
             .send()
             .await
             .expect("update user request");
@@ -252,6 +302,77 @@ async fn fetch_admin_token(client: &reqwest::Client, base_url: &str) -> Option<V
     resp.json::<Value>().await.ok()
 }
 
+/// True for a captured entry that's the deprovision deactivation this test waits for:
+/// either a PATCH whose Operations array targets `active`, or a PUT whose body carries
+/// `active: false`. Kept as its own predicate rather than inlined in the `wait_for`
+/// closure -- the PATCH/PUT shape distinction is exactly the thing under test here, and a
+/// tangled boolean expression inline was easy to get subtly wrong.
+fn is_deactivation(entry: &Value) -> bool {
+    match entry["method"].as_str() {
+        Some("PATCH") => entry["body"]["Operations"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op["path"] == "active")),
+        Some("PUT") => entry["body"]["active"] == json!(false),
+        _ => false,
+    }
+}
+
+// `is_deactivation`'s own PATCH-vs-PUT shape matching is what the live test above relies
+// on to tell a genuine deprovision request apart from an unrelated one (see the module
+// doc's note on the capture-count race a *caller-side* fix addresses separately) -- but
+// this function only ever runs inside that #[ignore]d test, which needs Docker + a real
+// Keycloak. `cargo test` alone, as CI's fast gate runs it, exercises this function zero
+// times. These unit tests cover the predicate itself directly, no Docker needed: pure
+// function, synthetic `Value`s in, `bool` out.
+#[cfg(test)]
+mod is_deactivation_tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_targeting_active_is_a_deactivation() {
+        let entry = json!({
+            "method": "PATCH",
+            "body": {"Operations": [{"op": "replace", "path": "active", "value": [false]}]}
+        });
+        assert!(is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_patch_not_targeting_active_is_not_a_deactivation() {
+        let entry = json!({
+            "method": "PATCH",
+            "body": {"Operations": [{"op": "replace", "path": "userName", "value": "x"}]}
+        });
+        assert!(!is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_put_with_active_false_is_a_deactivation() {
+        let entry = json!({"method": "PUT", "body": {"active": false, "userName": "x"}});
+        assert!(is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_put_with_active_true_is_not_a_deactivation() {
+        // Exactly the shape the earlier CREATE/UPDATE-to-active-true steps produce --
+        // must not be mistaken for a deprovision deactivation.
+        let entry = json!({"method": "PUT", "body": {"active": true, "userName": "x"}});
+        assert!(!is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_post_is_never_a_deactivation() {
+        let entry = json!({"method": "POST", "body": {"active": false}});
+        assert!(!is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_delete_is_never_a_deactivation() {
+        let entry = json!({"method": "DELETE", "body": null});
+        assert!(!is_deactivation(&entry));
+    }
+}
+
 async fn captured_users(client: &reqwest::Client) -> Vec<Value> {
     let resp = client
         .get(format!("http://localhost:{SERVER_PORT}/__captured/user"))
@@ -263,7 +384,7 @@ async fn captured_users(client: &reqwest::Client) -> Vec<Value> {
 }
 
 #[tokio::test]
-#[ignore = "requires a live Keycloak + keycloak-scim instance -- see docker-compose.yml"]
+#[ignore = "requires a live Keycloak + keycloak-scim-client instance -- see docker-compose.yml"]
 async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     let app = build_router(AppState::new(BEARER_TOKEN));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", SERVER_PORT))
@@ -297,12 +418,12 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
         },
     )
     .await;
-    // RFC 7643 4.1.1's `active` is boolean -- this is the coercion fix's live-traffic
-    // proof: whatever string/bool shape the plugin actually sent, the server's stored
-    // (and here, captured pre-parse) response must reflect a real create having
-    // succeeded through scimforge's User deserialization, not just this test's assumption
-    // of what Keycloak sends.
     assert_eq!(create_entry["method"], "POST");
+    // little-auth/keycloak-scim-client's KeycloakUserMapper.toScimUser() never sets `id`
+    // (only externalId, the Keycloak user id) -- proving this server never received a
+    // client-supplied id to (incorrectly) trust in the first place.
+    assert!(create_entry["body"].get("id").is_none());
+    assert_eq!(create_entry["body"]["externalId"], json!(keycloak_user_id));
     println!(
         "issue #1 finding -- POST /Users Content-Type: {:?}",
         create_entry["contentType"]
@@ -312,54 +433,26 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
         create_entry["body"]
     );
 
+    // Bridges a real gap this stateful plugin introduces: this server observing the POST
+    // only proves Keycloak's HTTP call completed, not that the plugin's own
+    // SCIM_SYNC_MAPPING row (scimId) write -- which happens synchronously right after, in
+    // the same background job, with no further network round trip this server could wait
+    // on -- has landed yet. Without this, the very next admin action below could race
+    // ahead of handleUpdate's `mapping.getScimId() == null` self-heal check and trigger an
+    // unwanted second CREATE instead of the intended PUT-replace.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     admin
-        .set_user_enabled(realm, &keycloak_user_id, false)
+        .set_user_enabled_via_full_representation(realm, &keycloak_user_id, false)
         .await;
 
+    // General Keycloak UPDATE admin events always dispatch a full PUT
+    // (ScimEventListenerProvider.handleUpdate -> ScimTargetClient.replaceUser) -- there is
+    // no PATCH-on-plain-update path in keycloak-scim-client. Asserting PUT specifically,
+    // not "PATCH or PUT", is itself a real conformance claim about this plugin's actual
+    // behavior, not a loosened check.
     let update_entry = wait_for(
-        "the example server to receive a PATCH or PUT reflecting the disabled user",
-        Duration::from_secs(30),
-        || {
-            let http = http.clone();
-            async move {
-                captured_users(&http).await.into_iter().find(|e| {
-                    (e["method"] == "PATCH" || e["method"] == "PUT") && e["id"].is_string()
-                })
-            }
-        },
-    )
-    .await;
-    println!(
-        "issue #1 finding -- {} /Users/{{id}} Content-Type: {:?}",
-        update_entry["method"], update_entry["contentType"]
-    );
-    println!(
-        "issue #1 finding -- {} /Users/{{id}} body: {}",
-        update_entry["method"], update_entry["body"]
-    );
-    // The concrete accommodation this whole harness exists to prove: if the plugin PATCHes
-    // `active` as the JSON string "false" (as its source predicts -- see
-    // src/patch.rs's coercion doc comment), the server must have coerced it, not stored a
-    // string. Only asserted when the update actually took the PATCH `active` path --
-    // Keycloak may instead have issued a full PUT, which this test still captures and
-    // prints above for the record either way.
-    if update_entry["method"] == "PATCH"
-        && let Some(ops) = update_entry["body"]["Operations"].as_array()
-        && let Some(op) = ops.iter().find(|op| op["path"] == "active")
-    {
-        println!("issue #1 finding -- active PATCH op value as sent: {op}");
-    }
-
-    // Only reachable because of docker/patches/0001-fix-delete-npe.patch: unpatched, the
-    // plugin's own event listener NullPointerExceptions on every single Admin-API user
-    // DELETE (getUser(userId) always returns null by the time the DELETE admin event
-    // fires, and the DELETE branch calls user.isEmailVerified() without a null check), so
-    // no DELETE ever reaches this server at all -- see this function's module doc and
-    // keycloak-it/README.md's findings section for the exact stack trace, root cause, and
-    // the patch that fixes it.
-    admin.delete_user(realm, &keycloak_user_id).await;
-    let delete_entry = wait_for(
-        "the example server to receive a DELETE for the removed user",
+        "the example server to receive a PUT reflecting the disabled user",
         Duration::from_secs(30),
         || {
             let http = http.clone();
@@ -367,10 +460,127 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
                 captured_users(&http)
                     .await
                     .into_iter()
-                    .find(|e| e["method"] == "DELETE")
+                    .find(|e| e["method"] == "PUT" && e["id"].is_string())
             }
         },
     )
     .await;
-    assert_eq!(delete_entry["method"], "DELETE");
+    assert_eq!(update_entry["method"], "PUT");
+    assert_eq!(update_entry["body"]["active"], json!(false));
+    // Proves this PUT actually deserializes as a complete, acceptable SCIM User (RFC 7643
+    // 4.1's REQUIRED userName present) -- the thing set_user_enabled_via_full_representation
+    // exists to guarantee. A PUT missing userName would still get captured here (capture
+    // happens before this server's own deserialization/validation), so this assertion is
+    // what actually distinguishes "arrived" from "arrived and was acceptable."
+    assert_eq!(update_entry["body"]["userName"], json!(username));
+    println!(
+        "issue #1 finding -- PUT /Users/{{id}} Content-Type: {:?}",
+        update_entry["contentType"]
+    );
+    println!(
+        "issue #1 finding -- PUT /Users/{{id}} body: {}",
+        update_entry["body"]
+    );
+
+    // Snapshot how many captures exist before triggering delete: the deactivation search
+    // below must find a *new* entry, not spuriously re-match update_entry above (both can
+    // legitimately be a PUT carrying active:false, so a shape-only predicate isn't enough
+    // on its own -- confirmed live this matters: without this guard, an actual delete-time
+    // dispatch failure was masked by silently re-matching the update step's own capture).
+    let captures_before_delete = captured_users(&http).await.len();
+
+    // Only reachable at all because keycloak-scim-client's AdminUserEventInterpreter
+    // derives the deleted user's id purely from AdminEvent#getResourcePath(), never by
+    // re-fetching the (already-gone) user -- a delete-after-row-gone dispatch never
+    // throws here, by construction. With the plugin's default SOFT_DELETE policy, a
+    // successful delete here dispatches a PATCH-with-PUT-fallback deactivation, not a
+    // literal DELETE verb -- see this file's module doc.
+    admin.delete_user(realm, &keycloak_user_id).await;
+    let deactivate_entry = wait_for(
+        "the example server to receive a new PATCH or PUT deactivating the deleted user",
+        Duration::from_secs(30),
+        || {
+            let http = http.clone();
+            async move {
+                captured_users(&http)
+                    .await
+                    .into_iter()
+                    .skip(captures_before_delete)
+                    .find(|e| e["id"].is_string() && is_deactivation(e))
+            }
+        },
+    )
+    .await;
+    println!(
+        "issue #1 finding -- deprovision {} /Users/{{id}} Content-Type: {:?}",
+        deactivate_entry["method"], deactivate_entry["contentType"]
+    );
+    println!(
+        "issue #1 finding -- deprovision {} /Users/{{id}} body: {}",
+        deactivate_entry["method"], deactivate_entry["body"]
+    );
+    if deactivate_entry["method"] == "PATCH" {
+        let ops = deactivate_entry["body"]["Operations"]
+            .as_array()
+            .expect("PATCH deprovision must carry an Operations array");
+        let active_op = ops
+            .iter()
+            .find(|op| op["path"] == "active")
+            .expect("PATCH deprovision must target the active attribute");
+        // Confirmed live, and genuinely surprising: de.captaingoldfish:scim-sdk-client
+        // (the SDK keycloak-scim-client is built on) wraps even a single-valued boolean
+        // PATCH replace value in a JSON *array* -- `[false]`, not a bare `false` -- when
+        // built via `.valueNode(BooleanNode.valueOf(active))`.
+        assert_eq!(active_op["value"], json!([false]));
+        println!(
+            "issue #1 finding -- scim-sdk-client wraps a single-valued boolean PATCH \
+             replace value in a JSON array: {}",
+            active_op["value"]
+        );
+
+        // Proves the PATCH succeeded outright, not that it was silently rejected and
+        // papered over by ScimTargetClient.setActive()'s own fetch-then-PUT fallback
+        // (which this server's earlier apply_patch_with_schema bug -- fixed in
+        // src/patch.rs -- would have silently triggered: this server's capture happens
+        // before its own deserialization/validation, so a rejected PATCH is captured
+        // exactly like an accepted one, and only a captured PUT that follows it reveals
+        // the fallback fired). A GET here isn't captured (users::get never calls
+        // store.capture), so a fallback would show up as a *second* new entry after this
+        // PATCH; a direct success leaves exactly one.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let entries_after_delete = captured_users(&http).await.len() - captures_before_delete;
+        assert_eq!(
+            entries_after_delete, 1,
+            "expected exactly one new captured request (the successful PATCH) after \
+             delete -- a second one would mean the PATCH was rejected and \
+             ScimTargetClient silently fell back to fetch-then-PUT instead"
+        );
+    } else {
+        assert_eq!(deactivate_entry["body"]["active"], json!(false));
+    }
+
+    // The strongest available proof this whole request actually applied correctly, not
+    // just that this server's capture log recorded *something*: fetch the resource back
+    // from this server's own store (still there under SOFT_DELETE -- deprovisioning
+    // deactivates, it doesn't remove the resource) and check `active` landed as a real
+    // JSON boolean. tests/router.rs has its own hand-crafted regression test for this
+    // exact array-wrapped shape (`coerce_to_attribute_type`'s array-unwrap
+    // accommodation, src/patch.rs) -- this is that same behavior proven against the real
+    // bytes a real SDK actually put on the wire, not just a synthetic shape.
+    let scim_id = deactivate_entry["id"]
+        .as_str()
+        .expect("deactivate_entry must carry the SCIM resource id");
+    let get_resp = http
+        .get(format!("http://localhost:{SERVER_PORT}/Users/{scim_id}"))
+        .bearer_auth(BEARER_TOKEN)
+        .send()
+        .await
+        .expect("get deactivated user request");
+    assert!(
+        get_resp.status().is_success(),
+        "get user failed: {}",
+        get_resp.status()
+    );
+    let persisted: Value = get_resp.json().await.expect("persisted user body");
+    assert_eq!(persisted["active"], json!(false));
 }

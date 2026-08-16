@@ -1,8 +1,10 @@
-//! `/Groups` handlers -- same shape and same caveats as `src/users.rs`, kept smaller
-//! since the Keycloak conformance test's primary target is the `propagation-user` path;
-//! `propagation-group` exercises the same PATCH/coercion code paths against a different
-//! resource type, so this exists for completeness rather than needing its own richer
-//! test surface.
+//! `/Groups` handlers -- same shape and same caveats as `src/users.rs`, kept smaller since
+//! nothing in the live conformance test drives it: `little-auth/keycloak-scim-client`'s
+//! `main` branch (Slice 1) has no group-sync feature at all -- its
+//! `AdminUserEventInterpreter` only ever interprets `ResourceType.USER` admin events, so
+//! there's no plugin-side config key or event path to exercise these routes against yet.
+//! They exist so `/Groups` isn't a 404 against `scimforge`'s own group support, not because
+//! the plugin under test currently propagates anything here.
 
 use axum::Json;
 use axum::extract::{Path, State};
