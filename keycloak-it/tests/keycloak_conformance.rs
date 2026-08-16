@@ -563,9 +563,10 @@ async fn real_keycloak_provisioning_traffic_parses_and_applies_correctly() {
     // just that this server's capture log recorded *something*: fetch the resource back
     // from this server's own store (still there under SOFT_DELETE -- deprovisioning
     // deactivates, it doesn't remove the resource) and check `active` landed as a real
-    // JSON boolean. This is scimforge's own apply_patch_with_schema unwrapping the
-    // array-wrapped value above, proven against real SDK traffic, not just the synthetic
-    // shapes in tests/router.rs.
+    // JSON boolean. tests/router.rs has its own hand-crafted regression test for this
+    // exact array-wrapped shape (`coerce_to_attribute_type`'s array-unwrap
+    // accommodation, src/patch.rs) -- this is that same behavior proven against the real
+    // bytes a real SDK actually put on the wire, not just a synthetic shape.
     let scim_id = deactivate_entry["id"]
         .as_str()
         .expect("deactivate_entry must carry the SCIM resource id");

@@ -212,14 +212,11 @@ async fn patches_a_boolean_attribute_sent_as_a_string_valued_replace_op() {
 }
 
 #[tokio::test]
-async fn patches_a_boolean_attribute_sent_as_the_native_boolean_keycloak_scim_client_actually_sends()
- {
-    // little-auth/keycloak-scim-client's ScimTargetClient.setActive() PATCHes `active` via
-    // `.valueNode(BooleanNode.valueOf(active))` -- a native JSON boolean, never a
-    // string-coerced one. No coercion is needed for this shape (it's already the target
-    // type), but this is the actual wire shape the live conformance test
-    // (tests/keycloak_conformance.rs) expects to observe, so it earns its own direct,
-    // Docker-free regression coverage here too.
+async fn patches_a_boolean_attribute_sent_as_a_bare_native_boolean() {
+    // RFC 7643 4.1's declared native type for `active` -- the baseline, no-coercion-needed
+    // shape. NOT what little-auth/keycloak-scim-client actually sends on the wire (see the
+    // array-wrapped test below, and keycloak-it/README.md's findings) -- kept as its own
+    // generic RFC-baseline case, same as the string-valued coercion test above.
     let router = app();
     let (_, created) = send(
         router.clone(),
@@ -235,6 +232,46 @@ async fn patches_a_boolean_attribute_sent_as_the_native_boolean_keycloak_scim_cl
         "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
         "Operations": [
             {"op": "replace", "path": "active", "value": false}
+        ]
+    });
+    let (status, patched) = send(
+        router,
+        authed("PATCH", &format!("/Users/{id}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&patch_body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["active"], json!(false));
+}
+
+#[tokio::test]
+async fn patches_a_boolean_attribute_sent_as_the_array_wrapped_value_keycloak_scim_client_actually_sends()
+ {
+    // little-auth/keycloak-scim-client's ScimTargetClient.setActive() PATCHes `active` via
+    // `.valueNode(BooleanNode.valueOf(active))` -- confirmed live (see
+    // keycloak-it/README.md's findings and tests/keycloak_conformance.rs) that
+    // scim-sdk-client's builder wraps even this single-valued boolean value in a JSON
+    // *array*, `[false]`, not a bare `false`. This is the actual wire shape the live
+    // conformance test expects to observe and needs `coerce_to_attribute_type`'s
+    // array-unwrap accommodation (src/patch.rs) to accept -- this is that fix's own
+    // direct, Docker-free regression coverage.
+    let router = app();
+    let (_, created) = send(
+        router.clone(),
+        authed("POST", "/Users")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json_body(&keycloak_style_create_body()))
+            .unwrap(),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap();
+
+    let patch_body = json!({
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+        "Operations": [
+            {"op": "replace", "path": "active", "value": [false]}
         ]
     });
     let (status, patched) = send(

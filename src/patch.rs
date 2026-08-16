@@ -402,10 +402,11 @@ fn apply_remove(
 }
 
 /// Coerces `value` toward the JSON-native form `attr_def` declares, accommodating two
-/// evidenced real-world SCIM client shapes rather than trusting RFC 7643's native types
-/// blindly. Only reachable from `apply_patch_with_schema`: `apply_patch` has no schema,
-/// so it has no declared type (or multi-valuedness) to coerce toward, and keeps storing
-/// whatever JSON shape it's given, unchanged.
+/// real-world SCIM client PATCH shapes rather than trusting RFC 7643's native types
+/// blindly -- one with a currently-evidenced live sender, one generic. Only reachable
+/// from `apply_patch_with_schema`: `apply_patch` has no schema, so it has no declared
+/// type (or multi-valuedness) to coerce toward, and keeps storing whatever JSON shape
+/// it's given, unchanged.
 ///
 /// 1. **Array-wrapped single value.** Some real SCIM SDKs (`de.captaingoldfish:scim-sdk-client`,
 ///    confirmed live via `little-auth/keycloak-scim-client`'s outbound PATCH traffic:
@@ -424,9 +425,8 @@ fn apply_remove(
 ///    Anything that isn't an exact canonical form (wrong case, leading zeros, whitespace,
 ///    non-finite) is left untouched rather than guessed at.
 ///
-/// Both accommodate one evidenced real sender each; neither is a general lenient-type
-/// parser, and they compose (an array-wrapped *and* string-encoded value unwraps, then
-/// coerces).
+/// Neither is a general lenient-type parser, and they compose (an array-wrapped *and*
+/// string-encoded value unwraps, then coerces).
 fn coerce_to_attribute_type(value: Value, attr_def: &discovery::AttributeDefinition) -> Value {
     let value = if !attr_def.multi_valued
         && let Value::Array(items) = &value
