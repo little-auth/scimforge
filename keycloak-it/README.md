@@ -125,14 +125,25 @@ exists to surface:
   states "every update carries a complete representation" -- true for Keycloak's own
   Admin Console (which GETs, mutates, and PUTs back the full representation, the pattern
   this harness's live test now uses), but not guaranteed for every Admin-REST-API caller.
-- **A genuinely surprising, but already-handled-correctly, SCIM SDK wire shape.**
-  `scim-sdk-client`'s PATCH builder (`.valueNode(BooleanNode.valueOf(active))`) wraps even
-  a single-valued boolean replace value in a JSON *array*:
-  `{"path":"active","value":[false]}`, not a bare `false`.
-  `scimforge::patch::apply_patch_with_schema` already handles it correctly with no
-  core-library change needed: the live run's own follow-up `GET /Users/{id}` after the
-  PATCH shows `active: false` persisted as a real JSON boolean, not the array, proving the
-  round-trip end to end.
+- **A real `scimforge` core-library bug, found live and fixed.** `scim-sdk-client`'s PATCH
+  builder (`.valueNode(BooleanNode.valueOf(active))`) wraps even a single-valued boolean
+  replace value in a JSON *array*: `{"path":"active","value":[false]}`, not a bare
+  `false`. `apply_patch_with_schema`'s `coerce_to_attribute_type` only recognized
+  `Value::String`, so that array passed through untouched, landed in the merged document
+  as a literal one-element array, and broke the very next typed round-trip
+  (`serde_json::from_value::<User>`) with `invalid type: sequence, expected a boolean` --
+  this server actually **rejected** the plugin's PATCH with a `400`. The first live run
+  that hit this looked like a pass: `ScimTargetClient.setActive()` treats a `4xx` PATCH
+  response as "PATCH not supported," records that, and silently falls back to a
+  fetch-then-PUT that *does* succeed (a native, fully-typed representation needs no
+  coercion) -- so the resource ended up correctly deactivated for the wrong reason, and
+  it took comparing this server's own capture log against `ScimEventListenerProvider`'s
+  Keycloak-side logs to catch that the "successful" run was actually PATCH-rejected,
+  PUT-recovered. Fixed in `src/patch.rs` (`coerce_to_attribute_type` now unwraps a
+  one-element array against a declared non-multi-valued attribute before coercing, RFC
+  7644 3.5.2's `value` only ever legitimately being an array for a multi-valued one) --
+  re-verified live afterward with a new assertion that counts captured requests, proving
+  the PATCH now succeeds on the first attempt with no fallback PUT following it.
 - **A race in this harness's own test, not in `keycloak-scim-client`.** An earlier version
   of the deactivation-entry search matched by shape alone (any `PUT`/`PATCH` carrying
   `active: false`), which the prior UPDATE step's own captured request can also satisfy --

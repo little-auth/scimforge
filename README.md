@@ -183,12 +183,16 @@ disposable example SCIM server built on this crate's own types, exercised in CI 
 real Keycloak instance running [little-auth/keycloak-scim-client](https://github.com/little-auth/keycloak-scim-client)
 (the in-house Keycloak SCIM client plugin -- Keycloak pushing provisioning events out, the
 same direction Okta/Azure AD operate in; targets that plugin's `main` branch only, Slice 1
-functionality). `apply_patch_with_schema` also coerces a PATCH `value` that's an exact
-canonical string form of a `boolean`/`integer`/`decimal` attribute's declared type (e.g.
-`"true"`, not `"True"`) into that native JSON type -- generic defensive handling for SCIM
-clients that PATCH a boolean attribute as a string rather than a native JSON boolean,
-rather than rejecting or silently mis-typing it (see `keycloak-it/`'s README for the full
-account).
+functionality). Two accommodations came directly out of that live traffic, both in
+`apply_patch_with_schema` only (the schema is what supplies a declared type/cardinality to
+coerce toward -- `apply_patch` has none of this and stores whatever JSON shape it's
+given): a PATCH `value` that's an exact canonical string form of a `boolean`/`integer`/
+`decimal` attribute's declared type (e.g. `"true"`, not `"True"`) coerces to that native
+JSON type; and a PATCH `value` arriving as a one-element JSON array against a declared
+non-multi-valued attribute (some real SCIM SDKs wrap even single-valued replace values
+this way) unwraps before that same type coercion runs. Neither guesses beyond an exact,
+evidenced shape (see `keycloak-it/`'s README for the live traffic that proved the second
+one, and `src/patch.rs`'s `coerce_to_attribute_type` doc comment for the full detail).
 
 ## License
 

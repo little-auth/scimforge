@@ -50,11 +50,11 @@ jobs:
         with:
           repository: little-auth/keycloak-scim-client
           # Pinned to the commit this harness was migrated against and last verified
-          # live (2026-08-16), not a moving `main` -- the same reproducibility discipline
-          # the old mitodl-targeted Dockerfile applied via its own KEYCLOAK_SCIM_COMMIT
-          # ARG. Bump deliberately, not implicitly: a newer keycloak-scim-client commit
+          # live (2026-08-16), not a moving `main` -- a commit ARG applied this same
+          # reproducibility discipline here before this workflow switched to a host-side
+          # build. Bump deliberately, not implicitly: a newer keycloak-scim-client commit
           # should be re-verified against this harness's live conformance test before
-          # this pin moves, the same way the old pin only moved after a verified build.
+          # this pin moves, the same way the previous pin only moved after a verified build.
           ref: 845386c
           token: ${{ secrets.KEYCLOAK_SCIM_CLIENT_PAT }}
           path: keycloak-scim-client-src
