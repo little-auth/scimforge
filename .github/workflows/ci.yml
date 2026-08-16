@@ -20,7 +20,7 @@ jobs:
       - name: fmt check
         run: cargo fmt --all -- --check
       - name: clippy
-        # --workspace: this repo is a Cargo workspace with a root package (scimforge)
+        # --workspace: this repo is a Cargo workspace with a root package (little-auth-scim)
         # plus keycloak-it (GitHub issue #1's example consumer) -- without --workspace,
         # commands run at the workspace root default to the root package alone (checked
         # directly: `cargo clippy --all-targets` here without this flag silently skips

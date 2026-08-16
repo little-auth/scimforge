@@ -1,10 +1,10 @@
 # keycloak-it
 
 A disposable example SCIM 2.0 consumer plus a real-Keycloak conformance test harness for
-`scimforge` (GitHub issue #1: "Real-IdP conformance testing"). **Not a reference
+`little-auth-scim` (GitHub issue #1: "Real-IdP conformance testing"). **Not a reference
 implementation** -- no persistence, no concurrency control beyond a single mutex, a
 single shared bearer token for auth, minimal error handling. It exists to give real
-Keycloak provisioning traffic somewhere to land, in front of `scimforge`'s own parsing and
+Keycloak provisioning traffic somewhere to land, in front of `little-auth-scim`'s own parsing and
 PATCH-application code, so this repo's RFC-literal conformance claims can be checked
 against what a real SCIM client actually sends -- not just against the spec text.
 
@@ -42,11 +42,11 @@ confirmation UI -- exist on separate branches (`feat/basic-auth-support`,
 merged into `main`** as of this writing. This harness targets what's actually on `main`
 today, not those branches; nothing here should be read as covering them.
 
-## `de.captaingoldfish:scim-sdk-client` vs. `scimforge` -- interop findings (little-auth/keycloak-scim-client)
+## `de.captaingoldfish:scim-sdk-client` vs. `little-auth-scim` -- interop findings (little-auth/keycloak-scim-client)
 
 [little-auth/keycloak-scim-client](https://github.com/little-auth/keycloak-scim-client) is a
 second, separate Keycloak SCIM plugin -- not exercised by this harness, which targets
-`mitodl/keycloak-scim` above -- built specifically to push to `scimforge`-based targets; it
+`mitodl/keycloak-scim` above -- built specifically to push to `little-auth-scim`-based targets; it
 reuses this repo's own `keycloak-it/` as its conformance target rather than standing up a new
 one. It's built on a newer `de.captaingoldfish:scim-sdk-client` **1.34.0** (vs.
 `mitodl/keycloak-scim`'s 1.25.1 above), and its `active`-flag PATCH path uses a different SDK
@@ -92,18 +92,18 @@ plugins exercise different SDK versions and different builder overloads:
   traffic end-to-end against a real Keycloak + real resolved vault credential, but has not yet
   exercised the deprovision/PATCH path with a captured wire body. So: **unconfirmed, not
   cleared**, for this specific call path and version.
-- **`scimforge`'s own PATCH handling isn't the risk surface here either way.** If #968 did
-  manifest, an inbound `"value":[true]` is what `scimforge` would receive where it expects
+- **`little-auth-scim`'s own PATCH handling isn't the risk surface here either way.** If #968 did
+  manifest, an inbound `"value":[true]` is what `little-auth-scim` would receive where it expects
   `"value":true`. `apply_patch_with_schema`'s type coercion (described above) only coerces a
   JSON *string* toward the declared type -- it does not unwrap a single-element array. A
   RFC-literal PATCH engine merging `[true]` untyped into a `boolean`-typed attribute would
   reject it (type mismatch) or store the array literally, not silently succeed with the wrong
-  scalar value. Worth a dedicated `scimforge`-side regression test if a live capture ever does
+  scalar value. Worth a dedicated `little-auth-scim`-side regression test if a live capture ever does
   reproduce #968 against either plugin's call path -- not added speculatively against a bug
   that hasn't been observed on the wire.
 
 **What's still open:** a live wire capture of `keycloak-scim-client`'s own `.valueNode()` PATCH
-path against a real `scimforge`/`keycloak-it` target -- driving a real Keycloak deprovision
+path against a real `little-auth-scim`/`keycloak-it` target -- driving a real Keycloak deprovision
 (disable-user) event through to a captured `/__captured` PATCH body -- would give live-verified
 evidence for the actual call path that plugin ships, rather than the source-read-plus-unit-test
 tier this section currently has for it. Not attempted here: out of scope for this
@@ -132,12 +132,12 @@ plaintext secret file has to exist before `docker compose up` (never committed -
 cd path/to/keycloak-scim-client
 git checkout 845386c
 ./mvnw clean package -DskipTests
-cp target/keycloak-scim-client-*.jar path/to/scimforge/keycloak-it/docker/keycloak-scim-client.jar
+cp target/keycloak-scim-client-*.jar path/to/little-auth-scim/keycloak-it/docker/keycloak-scim-client.jar
 
 # 2. Create the vault secret the credentialVaultRef in the test's component config
 #    resolves through (REALM_UNDERSCORE_KEY convention: realm "scim-it" + key
 #    "scim-target-token")
-cd path/to/scimforge
+cd path/to/little-auth-scim
 mkdir -p keycloak-it/docker/vault
 printf '%s' "scim-it-conformance-test-token" > keycloak-it/docker/vault/scim-it_scim-target-token
 
@@ -196,7 +196,7 @@ exists to surface:
   states "every update carries a complete representation" -- true for Keycloak's own
   Admin Console (which GETs, mutates, and PUTs back the full representation, the pattern
   this harness's live test now uses), but not guaranteed for every Admin-REST-API caller.
-- **A real `scimforge` core-library bug, found live and fixed.** `scim-sdk-client`'s PATCH
+- **A real `little-auth-scim` core-library bug, found live and fixed.** `scim-sdk-client`'s PATCH
   builder (`.valueNode(BooleanNode.valueOf(active))`) wraps even a single-valued boolean
   replace value in a JSON *array*: `{"path":"active","value":[false]}`, not a bare
   `false`. `apply_patch_with_schema`'s `coerce_to_attribute_type` only recognized
@@ -227,11 +227,11 @@ exists to surface:
 ## What this harness does *not* cover
 
 - Filter-query evaluation over a collection (`GET /Users?filter=...`): out of scope for
-  `scimforge` itself (see `src/filter.rs`'s module doc) and not exercised by the plugin's
+  `little-auth-scim` itself (see `src/filter.rs`'s module doc) and not exercised by the plugin's
   event-driven push path, which is what this harness targets.
 - Group sync: `keycloak-scim-client`'s `main` branch has no group-sync feature at all
   (Slice 1 only handles `ResourceType.USER` admin events) -- `/Groups` routes exist so
-  this server isn't a 404 against `scimforge`'s own group support, but nothing in the live
+  this server isn't a 404 against `little-auth-scim`'s own group support, but nothing in the live
   conformance test drives them, and there's no plugin-side config key to point at them yet.
 - `HARD_DELETE`: the live conformance test only exercises `keycloak-scim-target`'s default
   `deletePolicy` (`SOFT_DELETE`), which deprovisions via PATCH/PUT deactivation, not a

@@ -1,9 +1,9 @@
-//! A disposable, in-memory SCIM 2.0 HTTP server built on `scimforge` -- exists solely to
+//! A disposable, in-memory SCIM 2.0 HTTP server built on `little-auth-scim` -- exists solely to
 //! give GitHub issue #1 (real-IdP conformance testing) a live consumer to point a real
 //! Keycloak instance at. **Not a reference implementation**: no persistence, no
 //! concurrency control beyond a single mutex, minimal error handling, a single shared
 //! bearer token for auth. Do not copy this as a starting point for a production SCIM
-//! server -- copy `scimforge`'s own module docs instead.
+//! server -- copy `little-auth-scim`'s own module docs instead.
 
 pub mod discovery;
 pub mod error;
@@ -95,15 +95,15 @@ async fn require_bearer_token(
     }
 }
 
-async fn service_provider_config() -> Json<scimforge::discovery::ServiceProviderConfig> {
+async fn service_provider_config() -> Json<little_auth_scim::discovery::ServiceProviderConfig> {
     Json(discovery::service_provider_config())
 }
 
-async fn resource_types() -> Json<Vec<scimforge::discovery::ResourceType>> {
+async fn resource_types() -> Json<Vec<little_auth_scim::discovery::ResourceType>> {
     Json(discovery::resource_types())
 }
 
-async fn schemas() -> Json<Vec<scimforge::discovery::SchemaResource>> {
+async fn schemas() -> Json<Vec<little_auth_scim::discovery::SchemaResource>> {
     Json(discovery::schemas())
 }
 

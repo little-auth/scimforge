@@ -175,7 +175,7 @@ async fn patches_a_boolean_attribute_sent_as_a_string_valued_replace_op() {
     // "true"/"false" rather than a native boolean (see src/patch.rs's coercion doc
     // comment) -- little-auth/keycloak-scim-client itself doesn't do this
     // (`ScimTargetClient.setActive` sends a native `BooleanNode`, see the test below), but
-    // scimforge's coercion is generic defensive behavior worth its own direct coverage
+    // little-auth-scim's coercion is generic defensive behavior worth its own direct coverage
     // regardless of which specific client this harness targets today.
     let router = app();
     let (_, created) = send(

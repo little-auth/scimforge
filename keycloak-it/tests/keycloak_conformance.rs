@@ -1,5 +1,5 @@
 //! GitHub issue #1: real Keycloak + little-auth/keycloak-scim-client provisioning traffic
-//! against a live scimforge-based consumer. `#[ignore]`d by default -- this needs a running
+//! against a live little-auth-scim-based consumer. `#[ignore]`d by default -- this needs a running
 //! Keycloak (brought up separately via `keycloak-it/docker/docker-compose.yml`, not by this
 //! test itself, so CI can isolate "bring up the stack" from "drive it and assert" as two
 //! reviewable steps) reachable at `KEYCLOAK_BASE_URL` (default `http://localhost:8090`).

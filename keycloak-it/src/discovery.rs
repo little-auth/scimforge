@@ -7,18 +7,18 @@
 //! correctly; `/Schemas` and `/ResourceTypes` exist for completeness rather than because
 //! the plugin's own event-driven push flow calls them today.
 
-use scimforge::discovery::{
+use little_auth_scim::discovery::{
     AuthenticationScheme, BulkConfig, FilterConfig, RESOURCE_TYPE_SCHEMA_URI, ResourceType,
     SERVICE_PROVIDER_CONFIG_SCHEMA_URI, SchemaResource, ServiceProviderConfig, Supported,
 };
-use scimforge::group::{GROUP_SCHEMA_URI, group_schema};
-use scimforge::user::{USER_SCHEMA_URI, enterprise_user_schema, user_schema};
+use little_auth_scim::group::{GROUP_SCHEMA_URI, group_schema};
+use little_auth_scim::user::{USER_SCHEMA_URI, enterprise_user_schema, user_schema};
 
 pub fn service_provider_config() -> ServiceProviderConfig {
     ServiceProviderConfig {
         schemas: vec![SERVICE_PROVIDER_CONFIG_SCHEMA_URI.to_string()],
         documentation_uri: Some(
-            "https://github.com/little-auth/scimforge/tree/main/keycloak-it".to_string(),
+            "https://github.com/little-auth/little-auth-scim/tree/main/keycloak-it".to_string(),
         ),
         patch: Supported { supported: true },
         bulk: BulkConfig {

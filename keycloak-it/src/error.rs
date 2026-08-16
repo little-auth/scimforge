@@ -3,8 +3,8 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use scimforge::error::{ScimError, ScimType};
-use scimforge::patch::PatchError;
+use little_auth_scim::error::{ScimError, ScimType};
+use little_auth_scim::patch::PatchError;
 
 use crate::patch_request::PatchRequestError;
 

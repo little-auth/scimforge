@@ -3,7 +3,7 @@ name = "keycloak-it"
 version = "0.0.0"
 edition = "2024"
 publish = false
-description = "Disposable example SCIM 2.0 consumer + Keycloak real-IdP conformance test harness for scimforge (GitHub issue #1) -- not a reference implementation, not published, not covered by scimforge's own conformance rigor."
+description = "Disposable example SCIM 2.0 consumer + Keycloak real-IdP conformance test harness for little-auth-scim (GitHub issue #1) -- not a reference implementation, not published, not covered by little-auth-scim's own conformance rigor."
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -16,7 +16,7 @@ name = "scim-it-server"
 path = "src/main.rs"
 
 [dependencies]
-scimforge = { path = ".." }
+little-auth-scim = { path = ".." }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }

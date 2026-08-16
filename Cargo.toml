@@ -1,17 +1,17 @@
 [workspace]
 members = ["keycloak-it"]
-# scimforge itself is a workspace root package, not a virtual-manifest workspace, so
-# `cargo build`/`cargo test` at the repo root still targets scimforge by default -- see
-# `cargo package --list -p scimforge` parity check in the keycloak-it implementation notes
-# for why this doesn't change what `scimforge` publishes to crates.io.
+# little-auth-scim itself is a workspace root package, not a virtual-manifest workspace, so
+# `cargo build`/`cargo test` at the repo root still targets little-auth-scim by default -- see
+# `cargo package --list -p little-auth-scim` parity check in the keycloak-it implementation notes
+# for why this doesn't change what `little-auth-scim` publishes to crates.io.
 
 [package]
-name = "scimforge"
+name = "little-auth-scim"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "SCIM 2.0 (RFC 7643/7644) server-side protocol implementation: schema, filter grammar, PATCH semantics, bulk operations -- storage-agnostic."
-repository = "https://github.com/little-auth/scimforge"
+repository = "https://github.com/little-auth/little-auth-scim"
 readme = "README.md"
 keywords = ["scim", "provisioning", "identity", "rfc7644", "rfc7643"]
 categories = ["authentication", "web-programming"]

@@ -246,7 +246,7 @@ pub fn find_attribute<'a>(
 /// including the common attributes a per-resource `SchemaResource` alone can't answer.
 ///
 /// ```
-/// use scimforge::discovery::is_case_exact;
+/// use little_auth_scim::discovery::is_case_exact;
 ///
 /// // No schema, not a common attribute: folds, per RFC 7643 2.2's stated default.
 /// assert!(!is_case_exact(None, None, "userName", None));

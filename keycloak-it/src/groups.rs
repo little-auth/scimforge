@@ -3,7 +3,7 @@
 //! `main` branch (Slice 1) has no group-sync feature at all -- its
 //! `AdminUserEventInterpreter` only ever interprets `ResourceType.USER` admin events, so
 //! there's no plugin-side config key or event path to exercise these routes against yet.
-//! They exist so `/Groups` isn't a 404 against `scimforge`'s own group support, not because
+//! They exist so `/Groups` isn't a 404 against `little-auth-scim`'s own group support, not because
 //! the plugin under test currently propagates anything here.
 
 use axum::Json;
@@ -12,9 +12,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use scimforge::common::{Meta, ResourceId};
-use scimforge::group::{GROUP_SCHEMA_URI, Group, group_schema};
-use scimforge::patch::apply_patch_with_schema;
+use little_auth_scim::common::{Meta, ResourceId};
+use little_auth_scim::group::{GROUP_SCHEMA_URI, Group, group_schema};
+use little_auth_scim::patch::apply_patch_with_schema;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -93,7 +93,7 @@ pub async fn list(State(state): State<AppState>) -> Json<Value> {
     let resources: Vec<Value> = store.groups.values().cloned().collect();
     let total = resources.len();
     Json(serde_json::json!({
-        "schemas": [scimforge::list_response::LIST_RESPONSE_SCHEMA_URI],
+        "schemas": [little_auth_scim::list_response::LIST_RESPONSE_SCHEMA_URI],
         "totalResults": total,
         "startIndex": 1,
         "itemsPerPage": total,

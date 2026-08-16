@@ -5,10 +5,10 @@
 //!
 //! Run with `cargo run --example filter_and_mutability`.
 
-use scimforge::discovery::is_case_exact;
-use scimforge::filter::{self, Filter};
-use scimforge::group::group_schema;
-use scimforge::patch::{PatchOp, PatchOperation, apply_patch_with_schema};
+use little_auth_scim::discovery::is_case_exact;
+use little_auth_scim::filter::{self, Filter};
+use little_auth_scim::group::group_schema;
+use little_auth_scim::patch::{PatchOp, PatchOperation, apply_patch_with_schema};
 use serde_json::json;
 
 fn main() {

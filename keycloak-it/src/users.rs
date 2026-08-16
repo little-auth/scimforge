@@ -1,6 +1,6 @@
 //! `/Users` handlers. Deliberately minimal: no real persistence, no concurrency control,
 //! no `PUT` conflict detection -- exists to get real Keycloak-plugin traffic in front of
-//! scimforge's parsing/validation/PATCH code, not to be a usable SCIM server.
+//! little-auth-scim's parsing/validation/PATCH code, not to be a usable SCIM server.
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -8,9 +8,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use scimforge::common::{Meta, ResourceId};
-use scimforge::patch::apply_patch_with_schema;
-use scimforge::user::{USER_SCHEMA_URI, User, user_schema};
+use little_auth_scim::common::{Meta, ResourceId};
+use little_auth_scim::patch::apply_patch_with_schema;
+use little_auth_scim::user::{USER_SCHEMA_URI, User, user_schema};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -93,7 +93,7 @@ pub async fn get(
 
 pub async fn list(State(state): State<AppState>) -> Json<Value> {
     // Filter-query evaluation over a whole collection is deliberately out of scope for
-    // scimforge itself (see src/filter.rs's module doc) and isn't exercised by the
+    // little-auth-scim itself (see src/filter.rs's module doc) and isn't exercised by the
     // Keycloak plugin's event-driven push path this harness targets (only its optional
     // periodic full-import sync would call this with a filter) -- so this ignores any
     // `?filter=` query and returns everything, documented rather than silently partial.
@@ -101,7 +101,7 @@ pub async fn list(State(state): State<AppState>) -> Json<Value> {
     let resources: Vec<Value> = store.users.values().cloned().collect();
     let total = resources.len();
     Json(serde_json::json!({
-        "schemas": [scimforge::list_response::LIST_RESPONSE_SCHEMA_URI],
+        "schemas": [little_auth_scim::list_response::LIST_RESPONSE_SCHEMA_URI],
         "totalResults": total,
         "startIndex": 1,
         "itemsPerPage": total,
