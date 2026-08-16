@@ -317,6 +317,60 @@ fn is_deactivation(entry: &Value) -> bool {
     }
 }
 
+// `is_deactivation` gates a load-bearing correctness property (see the module doc's note
+// on the race this fixed) but only ever runs inside the #[ignore]d live test above, which
+// needs Docker + a real Keycloak -- meaning `cargo test` alone, as CI's fast gate runs it,
+// exercises this function zero times. These unit tests close that gap without needing
+// Docker at all: pure function, synthetic `Value`s in, `bool` out.
+#[cfg(test)]
+mod is_deactivation_tests {
+    use super::*;
+
+    #[test]
+    fn a_patch_targeting_active_is_a_deactivation() {
+        let entry = json!({
+            "method": "PATCH",
+            "body": {"Operations": [{"op": "replace", "path": "active", "value": [false]}]}
+        });
+        assert!(is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_patch_not_targeting_active_is_not_a_deactivation() {
+        let entry = json!({
+            "method": "PATCH",
+            "body": {"Operations": [{"op": "replace", "path": "userName", "value": "x"}]}
+        });
+        assert!(!is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_put_with_active_false_is_a_deactivation() {
+        let entry = json!({"method": "PUT", "body": {"active": false, "userName": "x"}});
+        assert!(is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_put_with_active_true_is_not_a_deactivation() {
+        // Exactly the shape the earlier CREATE/UPDATE-to-active-true steps produce --
+        // must not be mistaken for a deprovision deactivation.
+        let entry = json!({"method": "PUT", "body": {"active": true, "userName": "x"}});
+        assert!(!is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_post_is_never_a_deactivation() {
+        let entry = json!({"method": "POST", "body": {"active": false}});
+        assert!(!is_deactivation(&entry));
+    }
+
+    #[test]
+    fn a_delete_is_never_a_deactivation() {
+        let entry = json!({"method": "DELETE", "body": null});
+        assert!(!is_deactivation(&entry));
+    }
+}
+
 async fn captured_users(client: &reqwest::Client) -> Vec<Value> {
     let resp = client
         .get(format!("http://localhost:{SERVER_PORT}/__captured/user"))
